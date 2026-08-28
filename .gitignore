@@ -1,4 +1,26 @@
+# Environment / secrets
 .env
-.venv/
+.env.local
+
+# Python
 __pycache__/
-.pytest_cache/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Uploaded audio (real user recordings, never commit)
+uploads/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
