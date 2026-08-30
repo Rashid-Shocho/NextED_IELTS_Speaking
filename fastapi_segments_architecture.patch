@@ -1,0 +1,466 @@
+diff -ruN a/add_segment_columns.py b/add_segment_columns.py
+--- a/add_segment_columns.py	1970-01-01 00:00:00.000000000 +0000
++++ b/add_segment_columns.py	2026-08-29 18:15:15.814604606 +0000
+@@ -0,0 +1,53 @@
++"""
++One-time migration: adds `segment_id` and `label` to speaking_parts.
++
++Needed for the new variable-segment architecture (Part 1 = intro + 3 topic
++cards, Part 3 = 2 topic cards, each its own row) instead of exactly one row
++per part_number. Existing rows get a best-effort backfilled segment_id
++derived from part_number so old data doesn't break -- backfilled rows won't
++have a meaningful `label` beyond "Part N", which is fine since they're from
++before this migration and won't be re-scored.
++
++Safe to re-run (IF NOT EXISTS / idempotent backfill).
++
++Run once: python add_segment_columns.py
++"""
++import os
++
++import psycopg
++from dotenv import load_dotenv
++
++load_dotenv()
++
++DATABASE_URL = os.getenv("DATABASE_URL")
++if not DATABASE_URL:
++    raise RuntimeError("DATABASE_URL is not configured")
++
++
++def main():
++    with psycopg.connect(DATABASE_URL) as conn:
++        with conn.cursor() as cur:
++            cur.execute(
++                """
++                ALTER TABLE speaking_parts
++                ADD COLUMN IF NOT EXISTS segment_id TEXT,
++                ADD COLUMN IF NOT EXISTS label TEXT;
++                """
++            )
++            # Backfill any pre-existing rows (from before this migration)
++            # with a synthetic segment_id/label so NOT NULL-style code paths
++            # downstream don't choke on legacy data.
++            cur.execute(
++                """
++                UPDATE speaking_parts
++                SET segment_id = COALESCE(segment_id, 'part' || part_number),
++                    label = COALESCE(label, 'Part ' || part_number)
++                WHERE segment_id IS NULL OR label IS NULL;
++                """
++            )
++            conn.commit()
++            print("✓ speaking_parts.segment_id and .label ready (added + backfilled if needed)")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN a/app/api/sessions.py b/app/api/sessions.py
+--- a/app/api/sessions.py	2026-08-29 18:15:15.796735297 +0000
++++ b/app/api/sessions.py	2026-08-29 18:15:15.815042457 +0000
+@@ -1,10 +1,10 @@
+ from fastapi import APIRouter, HTTPException, status
+ from uuid import uuid4
+ from datetime import datetime, timezone
+-from fastapi import HTTPException, BackgroundTasks, UploadFile, File, Form
++from fastapi import HTTPException, BackgroundTasks, Request
+ from app.models.schemas import ReportResponse, BandScores
+ import asyncio
+-import shutil
++import json
+ from pathlib import Path
+ 
+ from app.core.database import get_connection
+@@ -41,16 +41,20 @@
+             parts_response = []
+             for p in payload.parts:
+                 part_id = uuid4()
++                seg_id = p.segment_id or f"part{p.part}"
++                label = p.label or f"Part {p.part}"
+                 cur.execute(
+                     """
+                     INSERT INTO speaking_parts
+-                        (id, session_id, part_number, question_text, audio_url, created_at)
+-                    VALUES (%s, %s, %s, %s, %s, %s)
++                        (id, session_id, part_number, segment_id, label, question_text, audio_url, created_at)
++                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     """,
+                     (
+                         str(part_id),
+                         str(session_id),
+                         p.part,
++                        seg_id,
++                        label,
+                         p.question_text,
+                         p.audio_url,
+                         now,
+@@ -60,6 +64,8 @@
+                     PartResponse(
+                         id=part_id,
+                         part_number=p.part,
++                        segment_id=seg_id,
++                        label=label,
+                         question_text=p.question_text,
+                         audio_url=p.audio_url,
+                     )
+@@ -77,47 +83,60 @@
+ 
+ 
+ @router.post("/submit", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+-async def submit_session(
+-    background_tasks: BackgroundTasks,
+-    user_id: str = Form(None),
+-    part1_question: str | None = Form(None),
+-    part2_question: str | None = Form(None),
+-    part3_question: str | None = Form(None),
+-    part1_audio: UploadFile | None = File(None),
+-    part2_audio: UploadFile | None = File(None),
+-    part3_audio: UploadFile | None = File(None),
+-):
++async def submit_session(background_tasks: BackgroundTasks, request: Request):
+     """
+-    At least one part must be provided (audio + its question text together).
+-    A part with only one of the two supplied is rejected -- rather than
+-    silently scoring a part with a missing prompt, or dropping audio the
+-    client thought it sent.
++    Accepts a variable number of segments instead of a fixed 3 parts, since
++    Part 1 and Part 3 are now each split into several separately-recorded
++    sub-questions (e.g. Part 1 = intro + 3 topic cards).
++
++    multipart/form-data body:
++      - user_id: optional string
++      - segments_meta: JSON string, a list of
++            {"id": "p1_intro", "part_number": 1, "label": "...", "question_text": "..."}
++      - audio_<id>: one file field per segment in segments_meta, e.g. audio_p1_intro
++
++    Every segment listed in segments_meta must have a matching audio_<id>
++    file; at least one segment is required.
+     """
+-    session_id = uuid4()
+-    now = datetime.now(timezone.utc)
+-    session_dir = UPLOAD_DIR / str(session_id)
+-    session_dir.mkdir(parents=True, exist_ok=True)
++    form = await request.form()
+ 
+-    candidate_parts = [
+-        (1, part1_question, part1_audio),
+-        (2, part2_question, part2_audio),
+-        (3, part3_question, part3_audio),
+-    ]
++    user_id = form.get("user_id") or None
++    raw_meta = form.get("segments_meta")
++    if not raw_meta:
++        raise HTTPException(status_code=400, detail="segments_meta is required.")
++
++    try:
++        meta_list = json.loads(raw_meta)
++    except (json.JSONDecodeError, TypeError):
++        raise HTTPException(status_code=400, detail="segments_meta must be valid JSON.")
++
++    if not isinstance(meta_list, list) or not meta_list:
++        raise HTTPException(status_code=400, detail="segments_meta must be a non-empty list.")
++
++    segments_input = []
++    for entry in meta_list:
++        seg_id = entry.get("id")
++        part_number = entry.get("part_number")
++        label = entry.get("label") or seg_id
++        question_text = entry.get("question_text")
+ 
+-    parts_input = []
+-    for part_number, question_text, audio_file in candidate_parts:
+-        has_question = bool(question_text and question_text.strip())
+-        has_audio = audio_file is not None
+-        if has_question != has_audio:
++        if not seg_id or part_number not in (1, 2, 3) or not question_text:
+             raise HTTPException(
+                 status_code=400,
+-                detail=f"Part {part_number}: question text and audio must both be provided, or both omitted.",
++                detail=f"Invalid segment metadata entry: {entry!r} "
++                       f"(needs id, part_number in 1-3, question_text).",
+             )
+-        if has_question and has_audio:
+-            parts_input.append((part_number, question_text, audio_file))
+ 
+-    if not parts_input:
+-        raise HTTPException(status_code=400, detail="At least one part (question + audio) is required.")
++        audio_file = form.get(f"audio_{seg_id}")
++        if audio_file is None or not hasattr(audio_file, "filename"):
++            raise HTTPException(status_code=400, detail=f"Missing audio file for segment '{seg_id}'.")
++
++        segments_input.append((seg_id, part_number, label, question_text, audio_file))
++
++    session_id = uuid4()
++    now = datetime.now(timezone.utc)
++    session_dir = UPLOAD_DIR / str(session_id)
++    session_dir.mkdir(parents=True, exist_ok=True)
+ 
+     with get_connection() as conn:
+         with conn.cursor() as cur:
+@@ -130,32 +149,36 @@
+             )
+ 
+             parts_response = []
+-            for part_number, question_text, audio_file in parts_input:
++            for seg_id, part_number, label, question_text, audio_file in segments_input:
+                 suffix = Path(audio_file.filename or "audio.webm").suffix or ".webm"
+-                saved_path = session_dir / f"part{part_number}{suffix}"
++                saved_path = session_dir / f"{seg_id}{suffix}"
+ 
++                contents = await audio_file.read()
+                 with saved_path.open("wb") as f:
+-                    shutil.copyfileobj(audio_file.file, f)
++                    f.write(contents)
+ 
+                 # Best-effort archival to R2 for the future training dataset.
+                 # Never blocks or fails the submission -- returns None (and
+                 # logs why) if R2 isn't configured or the upload errors.
+                 # Local disk stays the source of truth for the live pipeline
+                 # either way (VAD/ASR/pronunciation keep reading saved_path).
+-                r2_key = f"speaking/{session_id}/part{part_number}{suffix}"
++                r2_key = f"speaking/{session_id}/{seg_id}{suffix}"
+                 cloud_audio_url = await asyncio.to_thread(upload_audio_to_r2, saved_path, r2_key)
+ 
+                 part_id = uuid4()
+                 cur.execute(
+                     """
+                     INSERT INTO speaking_parts
+-                        (id, session_id, part_number, question_text, audio_url, cloud_audio_url, created_at)
+-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
++                        (id, session_id, part_number, segment_id, label, question_text,
++                         audio_url, cloud_audio_url, created_at)
++                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     """,
+                     (
+                         str(part_id),
+                         str(session_id),
+                         part_number,
++                        seg_id,
++                        label,
+                         question_text,
+                         str(saved_path),
+                         cloud_audio_url,
+@@ -166,6 +189,8 @@
+                     PartResponse(
+                         id=part_id,
+                         part_number=part_number,
++                        segment_id=seg_id,
++                        label=label,
+                         question_text=question_text,
+                         audio_url=str(saved_path),
+                     )
+@@ -202,12 +227,12 @@
+ 
+             cur.execute(
+                 """
+-                SELECT id, part_number, question_text, audio_url,
++                SELECT id, part_number, segment_id, label, question_text, audio_url,
+                        transcript, fluency_features, pronunciation,
+                        status, error_reason
+                 FROM speaking_parts
+                 WHERE session_id = %s
+-                ORDER BY part_number
++                ORDER BY part_number, segment_id
+                 """,
+                 (session_id,),
+             )
+@@ -217,13 +242,15 @@
+         PartResponse(
+             id=r[0],
+             part_number=r[1],
+-            question_text=r[2],
+-            audio_url=r[3],
+-            transcript=r[4],
+-            fluency_features=r[5],
+-            pronunciation=r[6],
+-            status=r[7],
+-            error_reason=r[8],
++            segment_id=r[2] or f"part{r[1]}",
++            label=r[3] or f"Part {r[1]}",
++            question_text=r[4],
++            audio_url=r[5],
++            transcript=r[6],
++            fluency_features=r[7],
++            pronunciation=r[8],
++            status=r[9],
++            error_reason=r[10],
+         )
+         for r in parts_rows
+     ]
+diff -ruN a/app/models/schemas.py b/app/models/schemas.py
+--- a/app/models/schemas.py	2026-08-29 18:15:15.797737402 +0000
++++ b/app/models/schemas.py	2026-08-29 18:15:15.815637330 +0000
+@@ -25,16 +25,20 @@
+     part: int = Field(..., ge=1, le=3)
+     question_text: str
+     audio_url: str
++    segment_id: Optional[str] = None
++    label: Optional[str] = None
+ 
+ 
+ class CreateSessionRequest(BaseModel):
+     user_id: Optional[str] = None
+-    parts: List[PartInput] = Field(..., min_length=1, max_length=3)
++    parts: List[PartInput] = Field(..., min_length=1, max_length=12)
+ 
+ 
+ class PartResponse(BaseModel):
+     id: UUID
+     part_number: int
++    segment_id: str
++    label: str
+     question_text: str
+     audio_url: str
+     transcript: Optional[str] = None
+diff -ruN a/app/services/llm_scorer.py b/app/services/llm_scorer.py
+--- a/app/services/llm_scorer.py	2026-08-29 18:15:15.798016223 +0000
++++ b/app/services/llm_scorer.py	2026-08-29 18:15:15.815885168 +0000
+@@ -86,29 +86,31 @@
+     )
+ 
+ 
+-async def score_session(
+-    questions: list[str],
+-    transcripts: list[str],
+-    fluency_features: list[dict],
+-    pronunciation_evidence: list[dict],
+-    part_numbers: list[int] | None = None,
+-) -> dict:
+-    part_numbers = part_numbers or list(range(1, len(questions) + 1))
++async def score_session(parts_grouped: dict[int, list[dict]]) -> dict:
++    """
++    parts_grouped: {1: [segment_result, ...], 2: [...], 3: [...]}, where each
++    segment_result has label/question_text/transcript/fluency_features/
++    pronunciation_result (see evaluate.run_part's return shape). A part can
++    have several segments (e.g. Part 1 = intro + 3 topic cards) -- each
++    keeps its own question directly paired with its own transcript and
++    evidence; grouping under a "### Part N" header only tells the LLM which
++    segments belong to the same IELTS part for rubric context, it does not
++    merge their content together.
++    """
+     parts_text = ""
+-    for part_no, q, t, flu, pron in zip(
+-        part_numbers, questions, transcripts, fluency_features, pronunciation_evidence
+-    ):
+-        pron_summary = _format_pronunciation_evidence(pron or {})
+-
+-        parts_text += f"""
+-### Part {part_no}
+-Question: {q}
+-Transcript: {t}
+-Fluency features: {json.dumps(flu)}
++    for part_no in sorted(parts_grouped.keys()):
++        parts_text += f"\n### Part {part_no}\n"
++        for seg in parts_grouped[part_no]:
++            pron_summary = _format_pronunciation_evidence(seg.get("pronunciation_result") or {})
++            parts_text += f"""
++[{seg.get("label", seg.get("segment_id", ""))}]
++Question: {seg["question_text"]}
++Transcript: {seg["transcript"]}
++Fluency features: {json.dumps(seg.get("fluency_features"))}
+ Pronunciation: {pron_summary}
+ """
+ 
+-    missing_parts = sorted(set([1, 2, 3]) - set(part_numbers))
++    missing_parts = sorted(set([1, 2, 3]) - set(parts_grouped.keys()))
+     missing_note = (
+         f"\nNOTE: Part(s) {', '.join(str(p) for p in missing_parts)} were not recorded/submitted -- "
+         f"grade holistically on whatever was provided and say so plainly in generalSummary."
+diff -ruN a/app/workers/evaluate.py b/app/workers/evaluate.py
+--- a/app/workers/evaluate.py	2026-08-29 18:15:15.798571387 +0000
++++ b/app/workers/evaluate.py	2026-08-29 18:15:15.816532930 +0000
+@@ -9,9 +9,9 @@
+ from app.services.llm_scorer import score_session
+ 
+ 
+-async def run_part(part_id: str, session_id: str, part_number: int,
++async def run_part(part_id: str, session_id: str, part_number: int, segment_id: str, label: str,
+                     question_text: str, audio_url: str, cloud_audio_url: str | None) -> dict:
+-    """Run one part through the LangGraph part workflow (VAD gate ->
++    """Run one segment through the LangGraph part workflow (VAD gate ->
+     transcribe+pronunciation -> finalize), see app/graph/workflow.py."""
+     initial_state = {
+         "part_id": part_id,
+@@ -25,6 +25,8 @@
+     return {
+         "part_id": part_id,
+         "part_number": part_number,
++        "segment_id": segment_id,
++        "label": label,
+         "question_text": question_text,
+         "audio_url": audio_url,
+         "cloud_audio_url": cloud_audio_url,
+@@ -67,10 +69,10 @@
+ 
+                 cur.execute(
+                     """
+-                    SELECT id, part_number, question_text, audio_url, cloud_audio_url
++                    SELECT id, part_number, segment_id, label, question_text, audio_url, cloud_audio_url
+                     FROM speaking_parts
+                     WHERE session_id = %s
+-                    ORDER BY part_number
++                    ORDER BY part_number, segment_id
+                     """,
+                     (session_id,),
+                 )
+@@ -80,7 +82,7 @@
+             raise ValueError(f"No parts found for session {session_id}")
+ 
+         tasks = [
+-            run_part(str(p[0]), session_id, p[1], p[2], p[3], p[4])
++            run_part(str(p[0]), session_id, p[1], p[2] or f"part{p[1]}", p[3] or f"Part {p[1]}", p[4], p[5], p[6])
+             for p in parts
+         ]
+         results = await asyncio.gather(*tasks)
+@@ -89,8 +91,8 @@
+         no_speech_parts = [r for r in results if r["status"] == "no_speech_detected"]
+ 
+         if no_speech_parts:
+-            part_numbers = ", ".join(str(r["part_number"]) for r in no_speech_parts)
+-            message = f"Part(s) {part_numbers} had no detectable speech. Please re-record and resubmit."
++            labels = ", ".join(r["label"] for r in no_speech_parts)
++            message = f"{labels} had no detectable speech. Please re-record and resubmit."
+ 
+             with get_connection() as conn:
+                 with conn.cursor() as cur:
+@@ -107,20 +109,16 @@
+             print(f"[Worker] Session {session_id} needs re-recording: {message}")
+             return  # SKIP [LLM] call entirely
+ 
+-        # --- all parts have speech -> single session-level [LLM] call ---
+-        part_numbers = [r["part_number"] for r in results]
+-        questions = [r["question_text"] for r in results]
+-        transcripts = [r["transcript"] for r in results]
+-        fluency_list = [r["fluency_features"] for r in results]
+-        pron_list = [r["pronunciation_result"] for r in results]
+-
+-        scores = await score_session(
+-            questions=questions,
+-            transcripts=transcripts,
+-            fluency_features=fluency_list,
+-            pronunciation_evidence=pron_list,
+-            part_numbers=part_numbers,
+-        )
++        # --- all segments have speech -> single session-level [LLM] call ---
++        # Group segments back under their parent part (1/2/3) so the LLM
++        # sees e.g. Part 1's intro + 3 topic cards as one coherent Part 1,
++        # while each segment keeps its own question/transcript/evidence
++        # pairing rather than being merged into one blob.
++        parts_grouped: dict[int, list[dict]] = {}
++        for r in results:
++            parts_grouped.setdefault(r["part_number"], []).append(r)
++
++        scores = await score_session(parts_grouped)
+ 
+         # speaking_reports only has dedicated columns for the 5 band scores --
+         # fold generalSummary/keyImprovements into the evidence JSON blob so
+@@ -129,7 +127,8 @@
+             **scores.get("evidence", {}),
+             "generalSummary": scores.get("generalSummary", ""),
+             "keyImprovements": scores.get("keyImprovements", []),
+-            "partsRecorded": part_numbers,
++            "partsRecorded": sorted(parts_grouped.keys()),
++            "segmentsRecorded": [r["segment_id"] for r in results],
+         }
+ 
+         with get_connection() as conn:

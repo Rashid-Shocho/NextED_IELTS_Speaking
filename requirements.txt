@@ -28,7 +28,10 @@ sqlalchemy==2.0.52
 torch
 torchaudio
 numpy
-ffmpeg-downloader
+av
+
+# Cloudflare R2 (S3-compatible) audio archival
+boto3
 
 # Utilities & Async Support
 python-dotenv==1.2.3

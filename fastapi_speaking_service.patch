@@ -1,0 +1,433 @@
+diff -ruN '--exclude=.git' a/.env.example b/.env.example
+--- a/.env.example	2026-08-28 17:17:35.943806379 +0000
++++ b/.env.example	2026-08-28 17:17:35.953400518 +0000
+@@ -0,0 +1,13 @@
++DATABASE_URL=postgresql://user:password@host:5432/dbname
++GROQ_API_KEY=
++HF_TOKEN=
++
++# RunPod pronunciation endpoint (wav2vec2-lv-60-espeak-cv-ft + forced_align)
++RUNPOD_API_KEY=
++RUNPOD_PRONUNCIATION_URL=https://api.runpod.ai/v2/xleyv5ilspgpbp/runsync
++
++# Shared secret the Next.js app sends as X-Internal-Api-Key on every
++# request to this service. Generate any long random string, e.g.:
++#   openssl rand -hex 32
++# and put the SAME value in the Next.js app's SPEAKING_API_KEY.
++INTERNAL_API_KEY=
+diff -ruN '--exclude=.git' a/app/api/sessions.py b/app/api/sessions.py
+--- a/app/api/sessions.py	2026-08-28 17:17:35.948445531 +0000
++++ b/app/api/sessions.py	2026-08-28 17:17:35.953655234 +0000
+@@ -1,178 +1,3 @@
+-# from fastapi import APIRouter, HTTPException, status
+-# from uuid import uuid4
+-# from datetime import datetime, timezone
+-# from fastapi import HTTPException, BackgroundTasks
+-# from app.models.schemas import ReportResponse, BandScores
+-
+-# from app.core.database import get_connection
+-# from app.models.schemas import (
+-#     CreateSessionRequest,
+-#     SessionResponse,
+-#     PartResponse,
+-#     SessionStatus,
+-# )
+-# from app.workers.evaluate import evaluate_session
+-
+-# router = APIRouter(prefix="/sessions", tags=["Speaking Sessions"])
+-
+-
+-# @router.post("", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+-# def create_session(payload: CreateSessionRequest):
+-#     session_id = uuid4()
+-#     now = datetime.now(timezone.utc)
+-
+-#     with get_connection() as conn:
+-#         with conn.cursor() as cur:
+-#             cur.execute(
+-#                 """
+-#                 INSERT INTO speaking_sessions (id, user_id, status, created_at)
+-#                 VALUES (%s, %s, %s, %s)
+-#                 """,
+-#                 (str(session_id), payload.user_id, SessionStatus.pending.value, now),
+-#             )
+-
+-#             parts_response = []
+-#             for p in payload.parts:
+-#                 part_id = uuid4()
+-#                 cur.execute(
+-#                     """
+-#                     INSERT INTO speaking_parts
+-#                         (id, session_id, part_number, question_text, audio_url, created_at)
+-#                     VALUES (%s, %s, %s, %s, %s, %s)
+-#                     """,
+-#                     (
+-#                         str(part_id),
+-#                         str(session_id),
+-#                         p.part,
+-#                         p.question_text,
+-#                         p.audio_url,
+-#                         now,
+-#                     ),
+-#                 )
+-#                 parts_response.append(
+-#                     PartResponse(
+-#                         id=part_id,
+-#                         part_number=p.part,
+-#                         question_text=p.question_text,
+-#                         audio_url=p.audio_url,
+-#                     )
+-#                 )
+-
+-#             conn.commit()
+-
+-#     return SessionResponse(
+-#         id=session_id,
+-#         user_id=payload.user_id,
+-#         status=SessionStatus.pending,
+-#         created_at=now,
+-#         parts=parts_response,
+-#     )
+-
+-
+-# @router.get("/{session_id}", response_model=SessionResponse)
+-# def get_session(session_id: str):
+-#     with get_connection() as conn:
+-#         with conn.cursor() as cur:
+-#             cur.execute(
+-#                 """
+-#                 SELECT id, user_id, status, created_at, completed_at
+-#                 FROM speaking_sessions
+-#                 WHERE id = %s
+-#                 """,
+-#                 (session_id,),
+-#             )
+-#             row = cur.fetchone()
+-#             if not row:
+-#                 raise HTTPException(status_code=404, detail="Session not found")
+-
+-#             cur.execute(
+-#                 """
+-#                 SELECT id, part_number, question_text, audio_url,
+-#                        transcript, fluency_features, pronunciation,
+-#                        status, error_reason
+-#                 FROM speaking_parts
+-#                 WHERE session_id = %s
+-#                 ORDER BY part_number
+-#                 """,
+-#                 (session_id,),
+-#             )
+-#             parts_rows = cur.fetchall()
+-
+-#     parts = [
+-#         PartResponse(
+-#             id=r[0],
+-#             part_number=r[1],
+-#             question_text=r[2],
+-#             audio_url=r[3],
+-#             transcript=r[4],
+-#             fluency_features=r[5],
+-#             pronunciation=r[6],
+-#             status=r[7],
+-#             error_reason=r[8],
+-#         )
+-#         for r in parts_rows
+-#     ]
+-
+-#     return SessionResponse(
+-#         id=row[0],
+-#         user_id=row[1],
+-#         status=SessionStatus(row[2]),
+-#         created_at=row[3],
+-#         completed_at=row[4],
+-#         parts=parts,
+-#     )
+-
+-
+-# @router.post("/{session_id}/evaluate")
+-# async def trigger_evaluation(session_id: str, background_tasks: BackgroundTasks):
+-#     background_tasks.add_task(evaluate_session, session_id)
+-#     return {"message": "Evaluation started", "session_id": session_id}
+-
+-
+-# @router.get("/{session_id}/report", response_model=ReportResponse)
+-# def get_report(session_id: str):
+-#     with get_connection() as conn:
+-#         with conn.cursor() as cur:
+-#             cur.execute(
+-#                 "SELECT status FROM speaking_sessions WHERE id = %s",
+-#                 (session_id,),
+-#             )
+-#             session_row = cur.fetchone()
+-#             if not session_row:
+-#                 raise HTTPException(status_code=404, detail="Session not found")
+-
+-#             status = session_row[0]
+-
+-#             cur.execute(
+-#                 """
+-#                 SELECT fluency, lexical, grammar, pronunciation, overall,
+-#                        evidence, created_at
+-#                 FROM speaking_reports
+-#                 WHERE session_id = %s
+-#                 """,
+-#                 (session_id,),
+-#             )
+-#             report_row = cur.fetchone()
+-
+-#             if not report_row:
+-#                 raise HTTPException(
+-#                     status_code=404,
+-#                     detail=f"Report not ready. Current status: {status}"
+-#                 )
+-
+-#     return ReportResponse(
+-#         session_id=session_id,
+-#         status=status,
+-#         scores=BandScores(
+-#             fluency=float(report_row[0]),
+-#             lexical=float(report_row[1]),
+-#             grammar=float(report_row[2]),
+-#             pronunciation=float(report_row[3]),
+-#             overall=float(report_row[4]),
+-#         ),
+-#         evidence=report_row[5] or {},
+-#         created_at=report_row[6],
+-#     )
+ from fastapi import APIRouter, HTTPException, status
+ from uuid import uuid4
+ from datetime import datetime, timezone
+@@ -253,24 +78,45 @@
+ async def submit_session(
+     background_tasks: BackgroundTasks,
+     user_id: str = Form(None),
+-    part1_question: str = Form(...),
+-    part2_question: str = Form(...),
+-    part3_question: str = Form(...),
+-    part1_audio: UploadFile = File(...),
+-    part2_audio: UploadFile = File(...),
+-    part3_audio: UploadFile = File(...),
++    part1_question: str | None = Form(None),
++    part2_question: str | None = Form(None),
++    part3_question: str | None = Form(None),
++    part1_audio: UploadFile | None = File(None),
++    part2_audio: UploadFile | None = File(None),
++    part3_audio: UploadFile | None = File(None),
+ ):
++    """
++    At least one part must be provided (audio + its question text together).
++    A part with only one of the two supplied is rejected -- rather than
++    silently scoring a part with a missing prompt, or dropping audio the
++    client thought it sent.
++    """
+     session_id = uuid4()
+     now = datetime.now(timezone.utc)
+     session_dir = UPLOAD_DIR / str(session_id)
+     session_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    parts_input = [
++    candidate_parts = [
+         (1, part1_question, part1_audio),
+         (2, part2_question, part2_audio),
+         (3, part3_question, part3_audio),
+     ]
+ 
++    parts_input = []
++    for part_number, question_text, audio_file in candidate_parts:
++        has_question = bool(question_text and question_text.strip())
++        has_audio = audio_file is not None
++        if has_question != has_audio:
++            raise HTTPException(
++                status_code=400,
++                detail=f"Part {part_number}: question text and audio must both be provided, or both omitted.",
++            )
++        if has_question and has_audio:
++            parts_input.append((part_number, question_text, audio_file))
++
++    if not parts_input:
++        raise HTTPException(status_code=400, detail="At least one part (question + audio) is required.")
++
+     with get_connection() as conn:
+         with conn.cursor() as cur:
+             cur.execute(
+diff -ruN '--exclude=.git' a/app/core/config.py b/app/core/config.py
+--- a/app/core/config.py	2026-08-28 17:17:35.948514884 +0000
++++ b/app/core/config.py	2026-08-28 17:17:35.953778894 +0000
+@@ -7,6 +7,11 @@
+     GROQ_API_KEY: str
+     HF_TOKEN: str
+ 
++    # Shared secret the Next.js app sends as `X-Internal-Api-Key` on every
++    # request. This service has no other auth (CORS is wildcard) so this is
++    # the only thing stopping a random caller from burning Groq/RunPod quota.
++    INTERNAL_API_KEY: str
++
+     # Models
+     GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
+     GROQ_LLM_MODEL: str = "openai/gpt-oss-20b"
+diff -ruN '--exclude=.git' a/app/main.py b/app/main.py
+--- a/app/main.py	2026-08-28 17:17:35.948645136 +0000
++++ b/app/main.py	2026-08-28 17:17:35.953992545 +0000
+@@ -1,7 +1,20 @@
+-from fastapi import FastAPI
++from fastapi import Depends, FastAPI, Header, HTTPException, status
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from app.api.sessions import router as sessions_router
++from app.core.config import get_settings
++
++settings = get_settings()
++
++
++async def require_internal_api_key(x_internal_api_key: str | None = Header(default=None)):
++    """
++    This service is called server-to-server from the Next.js app, not
++    directly from the browser -- so this is a plain shared-secret header
++    check, not user auth. Every /sessions/* route depends on this.
++    """
++    if not x_internal_api_key or x_internal_api_key != settings.INTERNAL_API_KEY:
++        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+ 
+ 
+ app = FastAPI(
+@@ -10,18 +23,18 @@
+     version="0.1.0",
+ )
+ 
+-# Frontend runs on a different origin (Next.js dev server / deployed domain),
+-# so the browser blocks requests without this. TODO: replace "*" with your
+-# actual frontend domain(s) before production (e.g. "https://yourapp.com").
++# Only the Next.js server calls this service directly (server-to-server),
++# so CORS doesn't need to be wide open. Restrict to known origins; add your
++# deployed Next.js domain here when you deploy.
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],
++    allow_origins=["http://localhost:3000"],
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
+ 
+-app.include_router(sessions_router)
++app.include_router(sessions_router, dependencies=[Depends(require_internal_api_key)])
+ 
+ 
+ @app.get("/health")
+diff -ruN '--exclude=.git' a/app/services/llm_scorer.py b/app/services/llm_scorer.py
+--- a/app/services/llm_scorer.py	2026-08-28 17:17:35.948805416 +0000
++++ b/app/services/llm_scorer.py	2026-08-28 17:17:35.954183325 +0000
+@@ -91,21 +91,30 @@
+     transcripts: list[str],
+     fluency_features: list[dict],
+     pronunciation_evidence: list[dict],
++    part_numbers: list[int] | None = None,
+ ) -> dict:
++    part_numbers = part_numbers or list(range(1, len(questions) + 1))
+     parts_text = ""
+-    for i, (q, t, flu, pron) in enumerate(
+-        zip(questions, transcripts, fluency_features, pronunciation_evidence), 1
++    for part_no, q, t, flu, pron in zip(
++        part_numbers, questions, transcripts, fluency_features, pronunciation_evidence
+     ):
+         pron_summary = _format_pronunciation_evidence(pron or {})
+ 
+         parts_text += f"""
+-### Part {i}
++### Part {part_no}
+ Question: {q}
+ Transcript: {t}
+ Fluency features: {json.dumps(flu)}
+ Pronunciation: {pron_summary}
+ """
+ 
++    missing_parts = sorted(set([1, 2, 3]) - set(part_numbers))
++    missing_note = (
++        f"\nNOTE: Part(s) {', '.join(str(p) for p in missing_parts)} were not recorded/submitted -- "
++        f"grade holistically on whatever was provided and say so plainly in generalSummary."
++        if missing_parts else ""
++    )
++
+     print("\n" + "=" * 70)
+     print("[LLM INPUT] Data being sent to the model:")
+     print("=" * 70)
+@@ -124,6 +133,8 @@
+   "grammar": 5.0,
+   "pronunciation": 6.5,
+   "overall": 5.5,
++  "generalSummary": "2-3 sentence holistic summary, mention any part not recorded",
++  "keyImprovements": ["short actionable tip 1", "short actionable tip 2", "short actionable tip 3"],
+   "evidence": {
+     "fluency": "short reason",
+     "lexical": "short reason",
+@@ -137,11 +148,12 @@
+ - Scores 0-9, use .5 steps
+ - overall = average of 4 scores, rounded to nearest 0.5
+ - For pronunciation: cite the single worst phoneme explicitly in your evidence if one is given. Base your score primarily on the % severe and the severe-mispronunciation list, not the raw average number alone. A high % excellent with few/no severe flags means strong pronunciation (band 7+); many severe flags means weak pronunciation (band 5 or below).
+-- Keep all text under 15 words
++- keyImprovements: 2-4 concrete, specific tips referencing what was actually said/measured -- no generic advice.
++- Keep all text under 15 words (generalSummary may run to 2-3 short sentences)
+ """
+ 
+     user_prompt = f"""Score this IELTS Speaking test:
+-
++{missing_note}
+ {parts_text}
+ 
+ Return only the JSON object."""
+@@ -213,11 +225,13 @@
+             "grammar": 6.5,
+             "pronunciation": 6.5,
+             "overall": 6.5,
++            "generalSummary": "Automated scoring failed for this submission. These are placeholder scores -- please retry.",
++            "keyImprovements": [],
+             "evidence": {
+                 "fluency": "Fallback due to LLM error",
+                 "lexical": "Fallback due to LLM error",
+                 "grammar": "Fallback due to LLM error",
+                 "pronunciation": "Fallback due to LLM error",
+-                "per_part_feedback": ["Error", "Error", "Error"],
++                "per_part_feedback": [],
+             },
+         }
+\ No newline at end of file
+diff -ruN '--exclude=.git' a/app/workers/evaluate.py b/app/workers/evaluate.py
+--- a/app/workers/evaluate.py	2026-08-28 17:17:35.948969406 +0000
++++ b/app/workers/evaluate.py	2026-08-28 17:17:35.954389474 +0000
+@@ -98,6 +98,7 @@
+             return  # SKIP [LLM] call entirely
+ 
+         # --- all parts have speech -> single session-level [LLM] call ---
++        part_numbers = [r["part_number"] for r in results]
+         questions = [r["question_text"] for r in results]
+         transcripts = [r["transcript"] for r in results]
+         fluency_list = [r["fluency_features"] for r in results]
+@@ -108,8 +109,19 @@
+             transcripts=transcripts,
+             fluency_features=fluency_list,
+             pronunciation_evidence=pron_list,
++            part_numbers=part_numbers,
+         )
+ 
++        # speaking_reports only has dedicated columns for the 5 band scores --
++        # fold generalSummary/keyImprovements into the evidence JSON blob so
++        # they persist and round-trip through GET /sessions/{id}/report.
++        evidence_to_store = {
++            **scores.get("evidence", {}),
++            "generalSummary": scores.get("generalSummary", ""),
++            "keyImprovements": scores.get("keyImprovements", []),
++            "partsRecorded": part_numbers,
++        }
++
+         with get_connection() as conn:
+             with conn.cursor() as cur:
+                 cur.execute(
+@@ -136,7 +148,7 @@
+                         scores["grammar"],
+                         scores["pronunciation"],
+                         scores["overall"],
+-                        Jsonb(scores["evidence"]),
++                        Jsonb(evidence_to_store),
+                         datetime.now(timezone.utc),
+                     ),
+                 )

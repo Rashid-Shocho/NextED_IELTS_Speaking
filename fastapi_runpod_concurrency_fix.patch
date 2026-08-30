@@ -1,0 +1,156 @@
+diff -ruN a/app/core/config.py b/app/core/config.py
+--- a/app/core/config.py	2026-08-29 18:54:53.619998323 +0000
++++ b/app/core/config.py	2026-08-29 18:54:53.650625992 +0000
+@@ -26,6 +26,11 @@
+     RUNPOD_PRONUNCIATION_URL: str = "https://api.runpod.ai/v2/xleyv5ilspgpbp/runsync"
+     RUNPOD_POLL_INTERVAL_SEC: float = 2.0
+     RUNPOD_POLL_TIMEOUT_SEC: float = 120.0
++    # With up to 7 segments now (vs 3 before), firing every pronunciation
++    # call at once floods RunPod's limited worker pool and most requests
++    # queue behind each other past any reasonable client timeout. Caps how
++    # many segments' RunPod calls run at once; the rest wait their turn.
++    RUNPOD_MAX_CONCURRENT: int = 3
+ 
+     # Cloudflare R2 (S3-compatible) -- archives every submitted audio clip
+     # for the future training dataset (speaking_training_samples). All
+diff -ruN a/app/services/pronunciation.py b/app/services/pronunciation.py
+--- a/app/services/pronunciation.py	2026-08-29 18:54:53.620890241 +0000
++++ b/app/services/pronunciation.py	2026-08-29 18:54:53.651817306 +0000
+@@ -33,6 +33,19 @@
+ ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "m4a", "ogg", "flac"}
+ TARGET_SR = 16000
+ 
++# Caps how many segments' RunPod calls run at once (see RUNPOD_MAX_CONCURRENT).
++# Created lazily so it binds to whatever event loop is actually running --
++# a Semaphore created at import time can bind to the wrong loop in some
++# ASGI server setups.
++_runpod_semaphore: asyncio.Semaphore | None = None
++
++
++def _get_runpod_semaphore() -> asyncio.Semaphore:
++    global _runpod_semaphore
++    if _runpod_semaphore is None:
++        _runpod_semaphore = asyncio.Semaphore(settings.RUNPOD_MAX_CONCURRENT)
++    return _runpod_semaphore
++
+ 
+ def _status_url(run_url: str, job_id: str) -> str:
+     """
+@@ -148,59 +161,64 @@
+     try:
+         audio_b64, audio_format = await _load_audio_b64_and_format(audio_url)
+ 
+-        async with httpx.AsyncClient(timeout=60.0) as client:
+-            submit_resp = await client.post(
+-                settings.RUNPOD_PRONUNCIATION_URL,
+-                headers=headers,
+-                json={
+-                    "input": {
+-                        "audio_base64": audio_b64,
+-                        "audio_format": audio_format,
+-                        "reference_text": reference_text,
+-                    }
+-                },
+-            )
+-            submit_resp.raise_for_status()
+-            submit_data = submit_resp.json()
+-
+-            job_id = submit_data.get("id")
+-            if not job_id:
+-                raise ValueError(f"RunPod response had no job id: {submit_data}")
+-
+-            status = submit_data.get("status")
+-            output = submit_data.get("output")
+-
+-            if status != "COMPLETED":
+-                status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
+-                elapsed = 0.0
+-
+-                while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
+-                    await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
+-                    elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
+-
+-                    poll_resp = await client.get(status_url, headers=headers)
+-                    poll_resp.raise_for_status()
+-                    poll_data = poll_resp.json()
+-                    status = poll_data.get("status")
+-
+-                    print(f"[Pronunciation] RunPod job {job_id} status={status} ({elapsed:.0f}s)")
+-
+-                    if status == "COMPLETED":
+-                        output = poll_data.get("output")
+-                        break
+-                    if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+-                        raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
+-                else:
+-                    raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
+-
+-            if isinstance(output, dict) and output.get("error"):
+-                raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
+-
+-            result = analyze_gop_result(output)
+-            print(f"[Pronunciation] {result['total_phonemes']} phonemes, "
+-                  f"avg={result['utterance_avg']}, severe={result['distribution']['severe']}, "
+-                  f"worst={result['worst_phoneme']}")
+-            return result
++        async with _get_runpod_semaphore():
++            # Long enough for RunPod to queue behind other concurrent
++            # segments AND cold-start a worker AND process up to ~90s of
++            # audio -- 60s was fine for one-off calls but not for several
++            # segments' worth of concurrent load.
++            async with httpx.AsyncClient(timeout=180.0) as client:
++                submit_resp = await client.post(
++                    settings.RUNPOD_PRONUNCIATION_URL,
++                    headers=headers,
++                    json={
++                        "input": {
++                            "audio_base64": audio_b64,
++                            "audio_format": audio_format,
++                            "reference_text": reference_text,
++                        }
++                    },
++                )
++                submit_resp.raise_for_status()
++                submit_data = submit_resp.json()
++
++                job_id = submit_data.get("id")
++                if not job_id:
++                    raise ValueError(f"RunPod response had no job id: {submit_data}")
++
++                status = submit_data.get("status")
++                output = submit_data.get("output")
++
++                if status != "COMPLETED":
++                    status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
++                    elapsed = 0.0
++
++                    while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
++                        await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
++                        elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
++
++                        poll_resp = await client.get(status_url, headers=headers)
++                        poll_resp.raise_for_status()
++                        poll_data = poll_resp.json()
++                        status = poll_data.get("status")
++
++                        print(f"[Pronunciation] RunPod job {job_id} status={status} ({elapsed:.0f}s)")
++
++                        if status == "COMPLETED":
++                            output = poll_data.get("output")
++                            break
++                        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
++                            raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
++                    else:
++                        raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
++
++                if isinstance(output, dict) and output.get("error"):
++                    raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
++
++                result = analyze_gop_result(output)
++                print(f"[Pronunciation] {result['total_phonemes']} phonemes, "
++                      f"avg={result['utterance_avg']}, severe={result['distribution']['severe']}, "
++                      f"worst={result['worst_phoneme']}")
++                return result
+ 
+     except Exception as e:
+         print(f"[Pronunciation] RunPod call failed ({type(e).__name__}: {e}), returning empty result")

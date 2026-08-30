@@ -1,0 +1,23 @@
+diff -ruN a/app/services/pronunciation.py b/app/services/pronunciation.py
+--- a/app/services/pronunciation.py	2026-08-29 10:35:59.633321674 +0000
++++ b/app/services/pronunciation.py	2026-08-29 10:35:59.663746467 +0000
+@@ -35,7 +35,18 @@
+ 
+ 
+ def _status_url(run_url: str, job_id: str) -> str:
+-    return re.sub(r"/run/?$", f"/status/{job_id}", run_url)
++    """
++    RunPod's synchronous endpoint is at .../runsync, but there's no GET
++    status route at that same path -- status checks go to .../status/{id}
++    instead. The pattern must match BOTH /run and /runsync (RunPod supports
++    either as the base path depending on how the endpoint was called);
++    matching only /run left /runsync URLs completely unchanged, so polling
++    silently GET-ed the POST-only /runsync route and always got a 404.
++    """
++    new_url, n = re.subn(r"/run(sync)?/?$", f"/status/{job_id}", run_url)
++    if n == 0:
++        raise ValueError(f"Could not derive a /status/ URL from RUNPOD_PRONUNCIATION_URL={run_url!r}")
++    return new_url
+ 
+ 
+ _DEFAULT_RESULT = {
