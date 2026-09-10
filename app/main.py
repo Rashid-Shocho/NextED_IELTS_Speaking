@@ -24,11 +24,12 @@ app = FastAPI(
 )
 
 # Only the Next.js server calls this service directly (server-to-server),
-# so CORS doesn't need to be wide open. Restrict to known origins; add your
-# deployed Next.js domain here when you deploy.
+# so CORS doesn't need to be wide open. Restrict to known origins, read from
+# ALLOWED_ORIGINS env var (comma-separated) -- set this to the deployed
+# Next.js domain before going live. Defaults to localhost for local dev.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=settings.allowed_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

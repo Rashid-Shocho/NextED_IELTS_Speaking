@@ -12,11 +12,28 @@ class Settings(BaseSettings):
     # the only thing stopping a random caller from burning Groq/RunPod quota.
     INTERNAL_API_KEY: str
 
+    # Comma-separated list of origins allowed to call this service directly
+    # from a browser (should just be the deployed Next.js app's origin(s) --
+    # this is server-to-server otherwise). Defaults to localhost for local
+    # dev; MUST be overridden in the deployed env or the beta frontend won't
+    # be able to reach this service at all.
+    ALLOWED_ORIGINS: str = "http://localhost:3000"
+
     # Models
     GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
     GROQ_LLM_MODEL: str = "openai/gpt-oss-20b"
     HF_EMBEDDING_MODEL: str = "BAAI/bge-base-en-v1.5"
     EMBEDDING_DIM: int = 768
+
+    # Retry policy for transient failures against Groq (ASR) and RunPod
+    # (pronunciation). Both services fail this many times before the part
+    # is marked "failed" and surfaced to the user -- see asr.py /
+    # pronunciation.py. Kept small: this is beta-safety against blips, not
+    # a substitute for fixing a service that's actually down.
+    TRANSCRIBE_MAX_ATTEMPTS: int = 3
+    TRANSCRIBE_RETRY_BACKOFF_SEC: float = 2.0
+    PRONUNCIATION_MAX_ATTEMPTS: int = 2
+    PRONUNCIATION_RETRY_BACKOFF_SEC: float = 3.0
 
     # ffmpeg (see app/services/vad.py)
     FFMPEG_PATH: str = "ffmpeg"
@@ -65,6 +82,10 @@ class Settings(BaseSettings):
             self.R2_ACCOUNT_ID and self.R2_ACCESS_KEY_ID
             and self.R2_SECRET_ACCESS_KEY and self.R2_BUCKET_NAME
         )
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
 @lru_cache

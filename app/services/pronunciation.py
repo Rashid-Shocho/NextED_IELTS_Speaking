@@ -18,6 +18,7 @@ Two things the RunPod handler requires that this must supply:
 import asyncio
 import base64
 import io
+import logging
 import re
 import wave
 from pathlib import Path
@@ -29,6 +30,14 @@ from app.core.config import get_settings
 from app.services.pronunciation_parser import analyze_gop_result
 
 settings = get_settings()
+logger = logging.getLogger("pronunciation")
+
+
+class PronunciationError(RuntimeError):
+    """Raised when pronunciation scoring fails after all retry attempts.
+    Left to propagate -- becomes part status='failed', which surfaces to
+    the user as a real error instead of a silently empty pronunciation
+    score baked into their band average."""
 
 ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "m4a", "ogg", "flac"}
 TARGET_SR = 16000
@@ -147,6 +156,74 @@ async def _load_audio_b64_and_format(audio_url: str) -> tuple[str, str]:
     return audio_b64, "wav"
 
 
+async def _analyze_pronunciation_once(audio_b64: str, audio_format: str, reference_text: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {settings.RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with _get_runpod_semaphore():
+        # Long enough for RunPod to queue behind other concurrent
+        # segments AND cold-start a worker AND process up to ~90s of
+        # audio -- 60s was fine for one-off calls but not for several
+        # segments' worth of concurrent load.
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            submit_resp = await client.post(
+                settings.RUNPOD_PRONUNCIATION_URL,
+                headers=headers,
+                json={
+                    "input": {
+                        "audio_base64": audio_b64,
+                        "audio_format": audio_format,
+                        "reference_text": reference_text,
+                    }
+                },
+            )
+            submit_resp.raise_for_status()
+            submit_data = submit_resp.json()
+
+            job_id = submit_data.get("id")
+            if not job_id:
+                raise ValueError(f"RunPod response had no job id: {submit_data}")
+
+            status = submit_data.get("status")
+            output = submit_data.get("output")
+
+            if status != "COMPLETED":
+                status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
+                elapsed = 0.0
+
+                while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
+                    await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
+                    elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
+
+                    poll_resp = await client.get(status_url, headers=headers)
+                    poll_resp.raise_for_status()
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status")
+
+                    logger.info("RunPod job %s status=%s (%.0fs)", job_id, status, elapsed)
+
+                    if status == "COMPLETED":
+                        output = poll_data.get("output")
+                        break
+                    if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                        raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
+                else:
+                    raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
+
+            if isinstance(output, dict) and output.get("error"):
+                raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
+
+            result = analyze_gop_result(output)
+            logger.info(
+                "%d phonemes, avg=%s, severe=%s, worst=%s",
+                result["total_phonemes"], result["utterance_avg"],
+                result["distribution"]["severe"], result["worst_phoneme"],
+            )
+            return result
+
+
 async def analyze_pronunciation(audio_url: str, reference_text: str) -> dict:
     """
     audio_url: local file path (see _load_audio_b64_and_format's TODO to
@@ -154,78 +231,37 @@ async def analyze_pronunciation(audio_url: str, reference_text: str) -> dict:
     reference_text: the transcript to forced-align against (from
                      transcribe_node -- pronunciation now runs after
                      transcription, not in parallel with it).
+
+    Retries transient RunPod failures (queueing, cold starts, blips) up to
+    PRONUNCIATION_MAX_ATTEMPTS times. If every attempt fails, raises
+    PronunciationError instead of silently returning an empty/default
+    result -- a failed pronunciation pass must not be averaged into the
+    user's band score as if it were a real (if poor) score.
+
+    The one legitimate silent case is an empty transcript: with nothing to
+    forced-align against, there's genuinely nothing to score, so that
+    returns _DEFAULT_RESULT rather than erroring.
     """
     if not reference_text or not reference_text.strip():
-        print("[Pronunciation] No reference_text (empty transcript) -- skipping RunPod call")
+        logger.info("No reference_text (empty transcript) -- skipping RunPod call")
         return _DEFAULT_RESULT
 
-    headers = {
-        "Authorization": f"Bearer {settings.RUNPOD_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    audio_b64, audio_format = await _load_audio_b64_and_format(audio_url)
 
-    try:
-        audio_b64, audio_format = await _load_audio_b64_and_format(audio_url)
+    last_error: Exception | None = None
+    for attempt in range(1, settings.PRONUNCIATION_MAX_ATTEMPTS + 1):
+        try:
+            return await _analyze_pronunciation_once(audio_b64, audio_format, reference_text)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "Pronunciation attempt %d/%d failed (%s: %s)",
+                attempt, settings.PRONUNCIATION_MAX_ATTEMPTS, type(e).__name__, e,
+            )
+            if attempt < settings.PRONUNCIATION_MAX_ATTEMPTS:
+                await asyncio.sleep(settings.PRONUNCIATION_RETRY_BACKOFF_SEC * attempt)
 
-        async with _get_runpod_semaphore():
-            # Long enough for RunPod to queue behind other concurrent
-            # segments AND cold-start a worker AND process up to ~90s of
-            # audio -- 60s was fine for one-off calls but not for several
-            # segments' worth of concurrent load.
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                submit_resp = await client.post(
-                    settings.RUNPOD_PRONUNCIATION_URL,
-                    headers=headers,
-                    json={
-                        "input": {
-                            "audio_base64": audio_b64,
-                            "audio_format": audio_format,
-                            "reference_text": reference_text,
-                        }
-                    },
-                )
-                submit_resp.raise_for_status()
-                submit_data = submit_resp.json()
-
-                job_id = submit_data.get("id")
-                if not job_id:
-                    raise ValueError(f"RunPod response had no job id: {submit_data}")
-
-                status = submit_data.get("status")
-                output = submit_data.get("output")
-
-                if status != "COMPLETED":
-                    status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
-                    elapsed = 0.0
-
-                    while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
-                        await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
-                        elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
-
-                        poll_resp = await client.get(status_url, headers=headers)
-                        poll_resp.raise_for_status()
-                        poll_data = poll_resp.json()
-                        status = poll_data.get("status")
-
-                        print(f"[Pronunciation] RunPod job {job_id} status={status} ({elapsed:.0f}s)")
-
-                        if status == "COMPLETED":
-                            output = poll_data.get("output")
-                            break
-                        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-                            raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
-                    else:
-                        raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
-
-                if isinstance(output, dict) and output.get("error"):
-                    raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
-
-                result = analyze_gop_result(output)
-                print(f"[Pronunciation] {result['total_phonemes']} phonemes, "
-                      f"avg={result['utterance_avg']}, severe={result['distribution']['severe']}, "
-                      f"worst={result['worst_phoneme']}")
-                return result
-
-    except Exception as e:
-        print(f"[Pronunciation] RunPod call failed ({type(e).__name__}: {e}), returning empty result")
-        return _DEFAULT_RESULT
+    raise PronunciationError(
+        f"Pronunciation scoring failed after {settings.PRONUNCIATION_MAX_ATTEMPTS} attempts: "
+        f"{type(last_error).__name__}: {last_error}"
+    ) from last_error
