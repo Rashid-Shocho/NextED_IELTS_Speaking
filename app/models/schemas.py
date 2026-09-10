@@ -25,16 +25,20 @@ class PartInput(BaseModel):
     part: int = Field(..., ge=1, le=3)
     question_text: str
     audio_url: str
+    segment_id: Optional[str] = None
+    label: Optional[str] = None
 
 
 class CreateSessionRequest(BaseModel):
     user_id: Optional[str] = None
-    parts: List[PartInput] = Field(..., min_length=1, max_length=3)
+    parts: List[PartInput] = Field(..., min_length=1, max_length=12)
 
 
 class PartResponse(BaseModel):
     id: UUID
     part_number: int
+    segment_id: str
+    label: str
     question_text: str
     audio_url: str
     transcript: Optional[str] = None

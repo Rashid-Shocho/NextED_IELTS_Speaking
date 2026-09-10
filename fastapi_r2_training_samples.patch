@@ -1,0 +1,339 @@
+diff -ruN a/.env.example b/.env.example
+--- a/.env.example	2026-08-29 09:32:34.213715097 +0000
++++ b/.env.example	2026-08-29 09:32:34.218132723 +0000
+@@ -11,3 +11,14 @@
+ #   openssl rand -hex 32
+ # and put the SAME value in the Next.js app's SPEAKING_API_KEY.
+ INTERNAL_API_KEY=
++
++# Cloudflare R2 (S3-compatible) -- optional. If left blank, audio archival
++# to R2 is skipped entirely and speaking_training_samples simply won't get
++# populated -- everything else keeps working exactly as before.
++R2_ACCOUNT_ID=
++R2_ACCESS_KEY_ID=
++R2_SECRET_ACCESS_KEY=
++R2_BUCKET_NAME=
++# Custom domain, or the bucket's public r2.dev URL (enable in Cloudflare
++# dashboard -> R2 -> bucket -> Settings -> Public Access). No trailing slash.
++R2_PUBLIC_BASE_URL=
+diff -ruN a/add_cloud_audio_url_column.py b/add_cloud_audio_url_column.py
+--- a/add_cloud_audio_url_column.py	1970-01-01 00:00:00.000000000 +0000
++++ b/add_cloud_audio_url_column.py	2026-08-29 09:32:34.218112539 +0000
+@@ -0,0 +1,35 @@
++"""
++One-time migration: adds `cloud_audio_url` to speaking_parts.
++
++Does NOT touch speaking_sessions, speaking_reports, or
++speaking_training_samples. Safe to re-run (IF NOT EXISTS).
++
++Run once: python add_cloud_audio_url_column.py
++"""
++import os
++
++import psycopg
++from dotenv import load_dotenv
++
++load_dotenv()
++
++DATABASE_URL = os.getenv("DATABASE_URL")
++if not DATABASE_URL:
++    raise RuntimeError("DATABASE_URL is not configured")
++
++
++def main():
++    with psycopg.connect(DATABASE_URL) as conn:
++        with conn.cursor() as cur:
++            cur.execute(
++                """
++                ALTER TABLE speaking_parts
++                ADD COLUMN IF NOT EXISTS cloud_audio_url TEXT;
++                """
++            )
++            conn.commit()
++            print("✓ speaking_parts.cloud_audio_url ready (added if it wasn't already there)")
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN a/app/api/sessions.py b/app/api/sessions.py
+--- a/app/api/sessions.py	2026-08-29 09:32:34.213955743 +0000
++++ b/app/api/sessions.py	2026-08-29 09:32:34.218351543 +0000
+@@ -3,6 +3,7 @@
+ from datetime import datetime, timezone
+ from fastapi import HTTPException, BackgroundTasks, UploadFile, File, Form
+ from app.models.schemas import ReportResponse, BandScores
++import asyncio
+ import shutil
+ from pathlib import Path
+ 
+@@ -13,6 +14,7 @@
+     PartResponse,
+     SessionStatus,
+ )
++from app.services.storage import upload_audio_to_r2
+ from app.workers.evaluate import evaluate_session
+ 
+ router = APIRouter(prefix="/sessions", tags=["Speaking Sessions"])
+@@ -135,12 +137,20 @@
+                 with saved_path.open("wb") as f:
+                     shutil.copyfileobj(audio_file.file, f)
+ 
++                # Best-effort archival to R2 for the future training dataset.
++                # Never blocks or fails the submission -- returns None (and
++                # logs why) if R2 isn't configured or the upload errors.
++                # Local disk stays the source of truth for the live pipeline
++                # either way (VAD/ASR/pronunciation keep reading saved_path).
++                r2_key = f"speaking/{session_id}/part{part_number}{suffix}"
++                cloud_audio_url = await asyncio.to_thread(upload_audio_to_r2, saved_path, r2_key)
++
+                 part_id = uuid4()
+                 cur.execute(
+                     """
+                     INSERT INTO speaking_parts
+-                        (id, session_id, part_number, question_text, audio_url, created_at)
+-                    VALUES (%s, %s, %s, %s, %s, %s)
++                        (id, session_id, part_number, question_text, audio_url, cloud_audio_url, created_at)
++                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     """,
+                     (
+                         str(part_id),
+@@ -148,6 +158,7 @@
+                         part_number,
+                         question_text,
+                         str(saved_path),
++                        cloud_audio_url,
+                         now,
+                     ),
+                 )
+diff -ruN a/app/core/config.py b/app/core/config.py
+--- a/app/core/config.py	2026-08-29 09:32:34.214032933 +0000
++++ b/app/core/config.py	2026-08-29 09:32:34.218446670 +0000
+@@ -27,10 +27,33 @@
+     RUNPOD_POLL_INTERVAL_SEC: float = 2.0
+     RUNPOD_POLL_TIMEOUT_SEC: float = 120.0
+ 
++    # Cloudflare R2 (S3-compatible) -- archives every submitted audio clip
++    # for the future training dataset (speaking_training_samples). All
++    # optional: if unset, uploads are skipped and the pipeline behaves
++    # exactly as before (local-disk-only), so this can be turned on
++    # whenever R2 credentials are ready without touching code.
++    R2_ACCOUNT_ID: str = ""
++    R2_ACCESS_KEY_ID: str = ""
++    R2_SECRET_ACCESS_KEY: str = ""
++    R2_BUCKET_NAME: str = ""
++    # Public base URL for reading objects back -- either your R2 custom
++    # domain, or the bucket's public r2.dev URL if you enabled it (Cloudflare
++    # dashboard -> R2 -> bucket -> Settings -> Public Access). No trailing
++    # slash, e.g. "https://audio.yourdomain.com" or
++    # "https://pub-xxxx.r2.dev".
++    R2_PUBLIC_BASE_URL: str = ""
++
+     class Config:
+         env_file = ".env"
+         extra = "ignore"
+ 
++    @property
++    def r2_configured(self) -> bool:
++        return bool(
++            self.R2_ACCOUNT_ID and self.R2_ACCESS_KEY_ID
++            and self.R2_SECRET_ACCESS_KEY and self.R2_BUCKET_NAME
++        )
++
+ 
+ @lru_cache
+ def get_settings() -> Settings:
+diff -ruN a/app/services/storage.py b/app/services/storage.py
+--- a/app/services/storage.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/storage.py	2026-08-29 09:32:34.218678930 +0000
+@@ -0,0 +1,70 @@
++"""
++Uploads audio clips to Cloudflare R2 (S3-compatible) so they're durably
++archived somewhere other than local disk -- feeds speaking_training_samples
++for the future fine-tuning dataset.
++
++Deliberately fail-soft: if R2 isn't configured (see Settings.r2_configured)
++or the upload errors for any reason, this returns None rather than raising.
++Local-disk processing (VAD/ASR/pronunciation) never depends on this --
++losing R2 should never break a live evaluation.
++"""
++
++import mimetypes
++from pathlib import Path
++
++import boto3
++from botocore.config import Config as BotoConfig
++
++from app.core.config import get_settings
++
++settings = get_settings()
++
++_client = None
++
++
++def _get_client():
++    global _client
++    if _client is not None:
++        return _client
++    _client = boto3.client(
++        "s3",
++        endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
++        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
++        aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
++        config=BotoConfig(signature_version="s3v4"),
++        region_name="auto",
++    )
++    return _client
++
++
++def upload_audio_to_r2(local_path: Path, key: str) -> str | None:
++    """
++    Synchronous (boto3 has no native async client) -- call via
++    asyncio.to_thread from async code. Returns the public URL on success,
++    or None if R2 isn't configured or the upload fails for any reason.
++    """
++    if not settings.r2_configured:
++        return None
++
++    content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
++
++    try:
++        client = _get_client()
++        client.upload_file(
++            str(local_path),
++            settings.R2_BUCKET_NAME,
++            key,
++            ExtraArgs={"ContentType": content_type},
++        )
++    except Exception as e:
++        print(f"[Storage] R2 upload failed for {local_path} -> {key}: {type(e).__name__}: {e}")
++        return None
++
++    if not settings.R2_PUBLIC_BASE_URL:
++        print(
++            f"[Storage] Uploaded to R2 as '{key}' but R2_PUBLIC_BASE_URL is not set -- "
++            "cannot build a public URL. Set it in .env (custom domain or r2.dev URL)."
++        )
++        return None
++
++    return f"{settings.R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+diff -ruN a/app/workers/evaluate.py b/app/workers/evaluate.py
+--- a/app/workers/evaluate.py	2026-08-29 09:32:34.214644270 +0000
++++ b/app/workers/evaluate.py	2026-08-29 09:32:34.219017215 +0000
+@@ -1,5 +1,6 @@
+ import asyncio
+ from datetime import datetime, timezone
++from pathlib import Path
+ 
+ from psycopg.types.json import Jsonb
+ 
+@@ -9,7 +10,7 @@
+ 
+ 
+ async def run_part(part_id: str, session_id: str, part_number: int,
+-                    question_text: str, audio_url: str) -> dict:
++                    question_text: str, audio_url: str, cloud_audio_url: str | None) -> dict:
+     """Run one part through the LangGraph part workflow (VAD gate ->
+     transcribe+pronunciation -> finalize), see app/graph/workflow.py."""
+     initial_state = {
+@@ -25,6 +26,8 @@
+         "part_id": part_id,
+         "part_number": part_number,
+         "question_text": question_text,
++        "audio_url": audio_url,
++        "cloud_audio_url": cloud_audio_url,
+         "status": final_state.get("status"),
+         "error_reason": final_state.get("error_reason"),
+         "transcript": final_state.get("transcript", ""),
+@@ -56,8 +59,15 @@
+                 conn.commit()
+ 
+                 cur.execute(
++                    "SELECT user_id FROM speaking_sessions WHERE id = %s",
++                    (session_id,),
++                )
++                session_row = cur.fetchone()
++                user_id = session_row[0] if session_row else None
++
++                cur.execute(
+                     """
+-                    SELECT id, part_number, question_text, audio_url
++                    SELECT id, part_number, question_text, audio_url, cloud_audio_url
+                     FROM speaking_parts
+                     WHERE session_id = %s
+                     ORDER BY part_number
+@@ -70,7 +80,7 @@
+             raise ValueError(f"No parts found for session {session_id}")
+ 
+         tasks = [
+-            run_part(str(p[0]), session_id, p[1], p[2], p[3])
++            run_part(str(p[0]), session_id, p[1], p[2], p[3], p[4])
+             for p in parts
+         ]
+         results = await asyncio.gather(*tasks)
+@@ -161,6 +171,53 @@
+                     """,
+                     (datetime.now(timezone.utc), session_id),
+                 )
++
++                # One pending row per part for the future training dataset.
++                # expert_* fields are left NULL for a human examiner to fill
++                # in later; consent_given defaults to false (schema default)
++                # -- flipping that to true is a product/consent-flow
++                # decision, not something this worker should do silently.
++                # audio_url here prefers the R2 URL; if R2 wasn't configured
++                # or the upload failed, falls back to the local path so the
++                # row still exists and can be backfilled later.
++                for r in results:
++                    if r["status"] != "pronunciation_done":
++                        continue  # defensive -- the no_speech gate above already covers this
++                    if not user_id:
++                        # speaking_training_samples.user_id is NOT NULL --
++                        # skip rather than fail this whole commit (which
++                        # would also roll back the report/completed status
++                        # that already succeeded above) for anonymous
++                        # sessions with no logged-in user.
++                        continue
++                    audio_url_for_dataset = r.get("cloud_audio_url") or r["audio_url"]
++                    audio_format = Path(r["audio_url"]).suffix.lstrip(".").lower() or None
++                    fluency_features = r.get("fluency_features") or {}
++                    cur.execute(
++                        """
++                        INSERT INTO speaking_training_samples (
++                            user_id, session_id, part_id, part_number,
++                            question_text, audio_url, audio_duration_seconds, audio_format,
++                            transcript_text, transcript_source,
++                            annotation_status
++                        )
++                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++                        """,
++                        (
++                            user_id,
++                            session_id,
++                            r["part_id"],
++                            r["part_number"],
++                            r["question_text"],
++                            audio_url_for_dataset,
++                            fluency_features.get("total_duration_sec"),
++                            audio_format,
++                            r["transcript"],
++                            "whisper",
++                            "pending",
++                        ),
++                    )
++
+                 conn.commit()
+ 
+         print(f"[Worker] Session {session_id} completed. Overall band: {scores['overall']}")
+diff -ruN a/requirements.txt b/requirements.txt
+--- a/requirements.txt	2026-08-29 09:32:34.216777579 +0000
++++ b/requirements.txt	2026-08-29 09:32:34.221246380 +0000
+@@ -30,6 +30,9 @@
+ numpy
+ av
+ 
++# Cloudflare R2 (S3-compatible) audio archival
++boto3
++
+ # Utilities & Async Support
+ python-dotenv==1.2.3
+ httpx>=0.27.0

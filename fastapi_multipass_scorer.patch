@@ -1,0 +1,484 @@
+diff -ruN a/app/services/band_descriptors.py b/app/services/band_descriptors.py
+--- a/app/services/band_descriptors.py	1970-01-01 00:00:00.000000000 +0000
++++ b/app/services/band_descriptors.py	2026-08-30 07:02:15.755598481 +0000
+@@ -0,0 +1,60 @@
++"""
++Condensed, paraphrased IELTS Speaking band descriptors (source: the public
++Cambridge/British Council band descriptor table). Paraphrased into our own
++words rather than reproduced verbatim -- this exists to give the scoring
++LLM a real anchor to compare evidence against, instead of guessing what
++"IELTS-style" scoring means from general training data.
++
++Only bands 4-9 are included: bands 0-3 describe near-total communication
++breakdown, which isn't a realistic outcome for anyone who completed a full
++test with substantive answers, and including them just dilutes the prompt.
++"""
++
++FLUENCY_COHERENCE = {
++    9: "Fluent, no effort; hesitation only to plan content, never to search for words/grammar; fully coherent.",
++    8: "Fluent with only occasional self-correction; hesitation is rare and content-related; coherent development.",
++    7: "Speaks at length without noticeable effort; some language-related hesitation, repetition, or self-correction; uses a range of discourse markers with some flexibility.",
++    6: "Willing to speak at length but coherence may slip due to hesitation/repetition/self-correction; uses discourse markers but not always appropriately.",
++    5: "Keeps going but leans on repetition, self-correction, or slowing down to maintain flow; simple speech is fluent but complex ideas cause breakdowns; may over-use certain connectives.",
++    4: "Frequent noticeable pauses, slow speech, frequent repetition/self-correction; basic sentences linked repetitively; some breakdowns in coherence.",
++}
++
++LEXICAL_RESOURCE = {
++    9: "Full flexibility and precision in all topics; uses idiomatic language naturally and accurately.",
++    8: "Wide vocabulary used flexibly and precisely; uses less common/idiomatic vocabulary skilfully with only occasional inaccuracy; paraphrases effectively.",
++    7: "Flexible vocabulary across topics; some less common/idiomatic vocabulary with some awareness of style/collocation, occasional inappropriate choices; paraphrases effectively.",
++    6: "Wide enough vocabulary to discuss topics at length and make meaning clear despite inappropriacies; generally paraphrases successfully.",
++    5: "Can discuss familiar and unfamiliar topics but with limited flexibility; attempts paraphrase with mixed success.",
++    4: "Can discuss familiar topics but only conveys basic meaning on unfamiliar ones; frequent word-choice errors; rarely attempts paraphrase.",
++}
++
++GRAMMAR = {
++    9: "Full range of structures used naturally; consistently accurate apart from native-speaker-like slips.",
++    8: "Wide range of structures used flexibly; majority of sentences error-free, only occasional inaccuracies.",
++    7: "Range of complex structures with some flexibility; frequently produces error-free sentences though some mistakes persist.",
++    6: "Mix of simple and complex structures with limited flexibility; frequent mistakes in complex structures, but these rarely block understanding.",
++    5: "Produces basic sentence forms with reasonable accuracy; limited range of more complex structures, usually containing errors that may cause some comprehension issues.",
++    4: "Basic sentence forms and some correct simple sentences, but subordinate structures are rare; errors are frequent and may cause misunderstanding.",
++}
++
++PRONUNCIATION = {
++    9: "Full range of phonological features used with precision; effortless to understand throughout.",
++    8: "Wide range of pronunciation features, sustained with only occasional lapses; easy to understand throughout, L1 accent has minimal effect.",
++    7: "Shows positive features of band 6 and some (not all) of band 8 -- a step up in control/range without being fully sustained.",
++    6: "Range of pronunciation features with mixed control; some effective use but not sustained; generally understood throughout, though individual word/sound mispronunciations reduce clarity at times.",
++    5: "Shows positive features of band 4 and some (not all) of band 6.",
++    4: "Limited range of pronunciation features; frequent lapses in control; mispronunciations are frequent and cause some difficulty for the listener.",
++}
++
++
++def format_descriptor_block(bands: list[int] = [4, 5, 6, 7, 8]) -> str:
++    lines = []
++    for b in bands:
++        lines.append(
++            f"Band {b}:\n"
++            f"  Fluency & Coherence: {FLUENCY_COHERENCE.get(b, '')}\n"
++            f"  Lexical Resource: {LEXICAL_RESOURCE.get(b, '')}\n"
++            f"  Grammar: {GRAMMAR.get(b, '')}\n"
++            f"  Pronunciation: {PRONUNCIATION.get(b, '')}"
++        )
++    return "\n\n".join(lines)
+diff -ruN a/app/services/llm_scorer.py b/app/services/llm_scorer.py
+--- a/app/services/llm_scorer.py	2026-08-30 07:02:15.734401806 +0000
++++ b/app/services/llm_scorer.py	2026-08-30 07:02:15.755612050 +0000
+@@ -2,9 +2,12 @@
+ import re
+ import httpx
+ from app.core.config import get_settings
++from app.services.band_descriptors import format_descriptor_block
+ 
+ settings = get_settings()
+ 
++GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
++
+ 
+ def extract_json(text: str) -> dict:
+     """Very tolerant JSON extractor."""
+@@ -42,6 +45,42 @@
+     raise ValueError("Could not extract valid JSON from model response")
+ 
+ 
++async def _call_groq_json(system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000) -> dict:
++    """
++    Shared plumbing for every scoring pass: call Groq, log input/output,
++    parse JSON. Raises on any failure -- callers decide how to degrade.
++    """
++    headers = {
++        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
++        "Content-Type": "application/json",
++    }
++    payload = {
++        "model": settings.GROQ_LLM_MODEL,
++        "messages": [
++            {"role": "system", "content": system_prompt},
++            {"role": "user", "content": user_prompt},
++        ],
++        "temperature": 0.1,
++        "max_tokens": max_tokens,
++    }
++
++    async with httpx.AsyncClient(timeout=90.0) as client:
++        print(f"[LLM:{label}] Calling model: {settings.GROQ_LLM_MODEL}")
++        response = await client.post(GROQ_URL, headers=headers, json=payload)
++        if response.status_code != 200:
++            print(f"[LLM:{label}] Error {response.status_code}: {response.text}")
++            response.raise_for_status()
++
++        data = response.json()
++        content = data["choices"][0]["message"]["content"]
++        finish_reason = data["choices"][0].get("finish_reason")
++        if finish_reason == "length":
++            print(f"[LLM:{label}] WARNING: response truncated by max_tokens.")
++
++        print(f"\n--- [LLM:{label}] raw response ---\n{content}\n--- end {label} ---\n")
++        return extract_json(content)
++
++
+ def _format_pronunciation_evidence(pron: dict) -> str:
+     """
+     Formats the receiver's output (pronunciation_parser.analyze_gop_result)
+@@ -86,141 +125,247 @@
+     )
+ 
+ 
+-async def score_session(parts_grouped: dict[int, list[dict]]) -> dict:
+-    """
+-    parts_grouped: {1: [segment_result, ...], 2: [...], 3: [...]}, where each
+-    segment_result has label/question_text/transcript/fluency_features/
+-    pronunciation_result (see evaluate.run_part's return shape). A part can
+-    have several segments (e.g. Part 1 = intro + 3 topic cards) -- each
+-    keeps its own question directly paired with its own transcript and
+-    evidence; grouping under a "### Part N" header only tells the LLM which
+-    segments belong to the same IELTS part for rubric context, it does not
+-    merge their content together.
+-    """
+-    parts_text = ""
++def _flatten_segments(parts_grouped: dict) -> list:
++    flat = []
+     for part_no in sorted(parts_grouped.keys()):
+-        parts_text += f"\n### Part {part_no}\n"
+         for seg in parts_grouped[part_no]:
+-            pron_summary = _format_pronunciation_evidence(seg.get("pronunciation_result") or {})
+-            parts_text += f"""
+-[{seg.get("label", seg.get("segment_id", ""))}]
+-Question: {seg["question_text"]}
+-Transcript: {seg["transcript"]}
+-Fluency features: {json.dumps(seg.get("fluency_features"))}
+-Pronunciation: {pron_summary}
+-"""
++            flat.append({**seg, "part_number": part_no})
++    return flat
+ 
+-    missing_parts = sorted(set([1, 2, 3]) - set(parts_grouped.keys()))
+-    missing_note = (
+-        f"\nNOTE: Part(s) {', '.join(str(p) for p in missing_parts)} were not recorded/submitted -- "
+-        f"grade holistically on whatever was provided and say so plainly in generalSummary."
+-        if missing_parts else ""
++
++# ---------- Pass A: Grammar & Lexical Resource (must quote the transcript) ----------
++
++async def _analyze_grammar_lexis(segments: list) -> dict:
++    transcripts_block = "\n\n".join(
++        f"[{seg.get('label', seg.get('segment_id',''))}] (Part {seg['part_number']})\n{seg['transcript']}"
++        for seg in segments if seg.get("transcript")
+     )
+ 
+-    print("\n" + "=" * 70)
+-    print("[LLM INPUT] Data being sent to the model:")
+-    print("=" * 70)
+-    print(parts_text)
+-    print("=" * 70 + "\n")
++    system_prompt = """You analyze IELTS Speaking transcripts for grammar and vocabulary evidence.
++
++CRITICAL RULE: every entry you list MUST include an exact quote copied from the transcript below -- not a paraphrase, not a made-up example. If you cannot find a real example in the text, do not invent one; simply list fewer entries.
++
++Reply with ONLY this JSON structure, no markdown, no extra text:
++{
++  "grammar_errors": [{"quote": "exact words from transcript", "issue": "what's wrong", "correction": "corrected version"}],
++  "grammar_strengths": [{"quote": "exact words", "note": "why this shows good control, e.g. accurate complex conditional"}],
++  "vocabulary_strengths": [{"quote": "exact words", "note": "why this is a strong lexical choice"}],
++  "vocabulary_issues": [{"quote": "exact words", "issue": "e.g. repetition, wrong register, imprecise word choice"}]
++}
++List up to 6 grammar_errors, 3 grammar_strengths, 3 vocabulary_strengths, 4 vocabulary_issues. Fewer is fine if the transcript doesn't support more genuine examples."""
++
++    user_prompt = f"Transcripts:\n\n{transcripts_block}\n\nReturn only the JSON object."
++
++    return await _call_groq_json(system_prompt, user_prompt, label="grammar_lexis")
++
++
++# ---------- Pass B: Fluency & Coherence (quantitative + quoted moments) ----------
+ 
+-    system_prompt = """You are an expert IELTS Speaking examiner.
+-Score the candidate holistically across all three parts.
++async def _analyze_fluency(segments: list) -> dict:
++    blocks = []
++    for seg in segments:
++        if not seg.get("transcript"):
++            continue
++        blocks.append(
++            f"[{seg.get('label', seg.get('segment_id',''))}] (Part {seg['part_number']})\n"
++            f"Transcript: {seg['transcript']}\n"
++            f"Timing: {json.dumps(seg.get('fluency_features'))}"
++        )
++    combined = "\n\n".join(blocks)
+ 
+-Reply with ONLY a valid JSON object. No thinking, no markdown, no extra text.
++    system_prompt = """You analyze IELTS Speaking fluency and coherence using BOTH the timing
++data provided (speech_rate_wpm, articulation_rate_wpm, phonation_time_ratio, pause_count,
++pause_total_sec) AND the transcript text.
+ 
+-Required structure (keep every string short):
++CRITICAL RULE: every fluency_observations entry MUST quote an exact moment from the transcript
++(a filler, a repeated phrase, a self-correction, an incomplete/run-on sentence) -- not a paraphrase.
++
++Reply with ONLY this JSON structure, no markdown, no extra text:
+ {
++  "fluency_observations": [{"label": "segment label", "quote": "exact words", "pattern": "filler | run-on | self-correction | repetition | incomplete-thought"}],
++  "quantitative_note": "1-2 sentences synthesizing the timing numbers across segments (e.g. consistent ~115wpm, moderate pausing, one notably slower segment)"
++}
++List up to 6 fluency_observations."""
++
++    user_prompt = f"Segments:\n\n{combined}\n\nReturn only the JSON object."
++
++    return await _call_groq_json(system_prompt, user_prompt, label="fluency")
++
++
++# ---------- Pass C: Pronunciation (filter artifacts from genuine issues) ----------
++
++async def _analyze_pronunciation(segments: list) -> dict:
++    blocks = []
++    for seg in segments:
++        pron_summary = _format_pronunciation_evidence(seg.get("pronunciation_result") or {})
++        blocks.append(f"[{seg.get('label', seg.get('segment_id',''))}] (Part {seg['part_number']})\n{pron_summary}")
++    combined = "\n\n".join(blocks)
++
++    system_prompt = """You review phoneme-level GOP (Goodness of Pronunciation) evidence across
++several IELTS Speaking segments. GOP scores are the recognizer's confidence, not a direct IELTS
++pronunciation judgment -- some flagged phonemes are forced-alignment artifacts, not genuine errors.
++
++Treat these as LIKELY ARTIFACTS and exclude them unless they recur heavily across MANY segments:
++- Glottal stops (\u0294) and syllabic consonants (n\u0329, l\u0329, m\u0329, \u014b\u0329) -- these are frequently alignment noise.
++- Any phoneme flagged only once (seen 1x) with a borderline score just past the severe threshold.
++
++Treat these as GENUINE signal worth reporting:
++- Any phoneme flagged 2+ times within a segment, or appearing as severe across multiple segments.
++- Classic ESL-difficulty sounds: /th/ sounds, /r/ /l/, /v/ /w/, vowel-length pairs, diphthongs.
++
++Reply with ONLY this JSON structure, no markdown, no extra text:
++{
++  "genuine_issues": [{"phoneme": "th-sound", "total_occurrences_flagged": 7, "note": "brief description of the pattern, e.g. recurs across 3 of 7 segments"}],
++  "excluded_as_likely_artifacts": ["glottal stop", "syllabic n"],
++  "overall_note": "1-2 sentences: overall intelligibility impression given the % excellent/severe across segments and which sounds are the real recurring pattern, if any"
++}
++List up to 6 genuine_issues, ranked by how consistently they recur."""
++
++    user_prompt = f"Pronunciation evidence per segment:\n\n{combined}\n\nReturn only the JSON object."
++
++    return await _call_groq_json(system_prompt, user_prompt, label="pronunciation")
++
++
++# ---------- Pass D: Final scoring, anchored to real band descriptors ----------
++
++async def _final_scoring(grammar_lexis: dict, fluency: dict, pronunciation: dict, missing_note: str) -> dict:
++    descriptor_block = format_descriptor_block([4, 5, 6, 7, 8])
++
++    system_prompt = f"""You are an expert IELTS Speaking examiner assigning final band scores.
++
++You are given ANALYST FINDINGS below (not raw transcripts) -- specific cited grammar/vocabulary
++examples, fluency observations, and a filtered pronunciation summary. Use these findings, anchored
++against the official band descriptors below, to assign scores.
++
++{descriptor_block}
++
++CRITICAL RULE: each "evidence" string below MUST reference a SPECIFIC finding from the analyst
++findings (quote or closely paraphrase one) -- never write a generic statement like "some errors
++occur" or "moderate pace" with nothing concrete behind it. If the findings for a criterion are
++thin, say so plainly rather than inventing detail.
++
++Reply with ONLY this JSON structure, no markdown, no extra text:
++{{
+   "fluency": 5.5,
+   "lexical": 5.0,
+   "grammar": 5.0,
+   "pronunciation": 6.5,
+   "overall": 5.5,
+-  "generalSummary": "2-3 sentence holistic summary, mention any part not recorded",
+-  "keyImprovements": ["short actionable tip 1", "short actionable tip 2", "short actionable tip 3"],
+-  "evidence": {
+-    "fluency": "short reason",
+-    "lexical": "short reason",
+-    "grammar": "short reason",
+-    "pronunciation": "short reason, cite the single worst phoneme if one is given",
++  "generalSummary": "2-3 sentences, holistic, mention any part not recorded",
++  "keyImprovements": ["specific tip referencing an actual finding", "..."],
++  "evidence": {{
++    "fluency": "must cite a specific fluency_observations entry or the quantitative_note",
++    "lexical": "must cite a specific vocabulary finding",
++    "grammar": "must cite a specific grammar finding",
++    "pronunciation": "must cite a specific genuine_issues entry or overall_note",
+     "per_part_feedback": ["short feedback 1", "short feedback 2", "short feedback 3"]
+-  }
+-}
++  }}
++}}
+ 
+ Rules:
+-- Scores 0-9, use .5 steps
+-- overall = average of 4 scores, rounded to nearest 0.5
+-- For pronunciation: cite the single worst phoneme explicitly in your evidence if one is given. Base your score primarily on the % severe and the severe-mispronunciation list, not the raw average number alone. A high % excellent with few/no severe flags means strong pronunciation (band 7+); many severe flags means weak pronunciation (band 5 or below).
+-- keyImprovements: 2-4 concrete, specific tips referencing what was actually said/measured -- no generic advice.
+-- Keep all text under 15 words (generalSummary may run to 2-3 short sentences)
++- Scores 0-9, use .5 steps. overall = average of the 4 scores, rounded to nearest 0.5.
++- keyImprovements: 2-4 tips, each grounded in a specific cited finding, not generic advice.
++- Keep evidence strings under 30 words each (must fit a quote/citation).
+ """
+ 
+-    user_prompt = f"""Score this IELTS Speaking test:
++    user_prompt = f"""ANALYST FINDINGS:
++
++--- Grammar & Lexical Resource ---
++{json.dumps(grammar_lexis, indent=2)}
++
++--- Fluency & Coherence ---
++{json.dumps(fluency, indent=2)}
++
++--- Pronunciation ---
++{json.dumps(pronunciation, indent=2)}
+ {missing_note}
+-{parts_text}
+ 
+ Return only the JSON object."""
+ 
+-    headers = {
+-        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+-        "Content-Type": "application/json",
+-    }
++    print("\n" + "=" * 70)
++    print("[LLM:final_scoring] Analyst findings being sent to the model:")
++    print("=" * 70)
++    print(user_prompt)
++    print("=" * 70 + "\n")
+ 
+-    payload = {
+-        "model": settings.GROQ_LLM_MODEL,
+-        "messages": [
+-            {"role": "system", "content": system_prompt},
+-            {"role": "user", "content": user_prompt},
+-        ],
+-        "temperature": 0.1,
+-        "max_tokens": 3000,
+-    }
++    return await _call_groq_json(system_prompt, user_prompt, label="final_scoring", max_tokens=1500)
++
++
++_FALLBACK_ANALYSIS = {"note": "Analysis pass failed for this run; see logs."}
++
++
++async def score_session(parts_grouped: dict) -> dict:
++    """
++    parts_grouped: {1: [segment_result, ...], 2: [...], 3: [...]}, where each
++    segment_result has label/question_text/transcript/fluency_features/
++    pronunciation_result (see evaluate.run_part's return shape).
++
++    Four-pass pipeline instead of one holistic call: a single small model
++    asked to juggle grammar+lexis+fluency+pronunciation+banding all at once
++    tends to produce generic, uncited evidence (verified against real
++    session logs). Splitting into focused passes that must quote specific
++    transcript/phoneme evidence, then a final pass that scores against real
++    IELTS band descriptor language referencing those findings, produces
++    evidence that's actually checkable against the source instead of being
++    a plausible-sounding guess.
++    """
++    segments = _flatten_segments(parts_grouped)
++
++    missing_parts = sorted(set([1, 2, 3]) - set(parts_grouped.keys()))
++    missing_note = (
++        f"\nNOTE: Part(s) {', '.join(str(p) for p in missing_parts)} were not recorded/submitted -- "
++        f"grade holistically on whatever was provided and say so plainly in generalSummary."
++        if missing_parts else ""
++    )
+ 
+     try:
+-        async with httpx.AsyncClient(timeout=90.0) as client:
+-            print(f"[LLM] Calling model: {settings.GROQ_LLM_MODEL}")
+-            response = await client.post(
+-                "https://api.groq.com/openai/v1/chat/completions",
+-                headers=headers,
+-                json=payload,
+-            )
+-
+-            if response.status_code != 200:
+-                print(f"[LLM] Error {response.status_code}: {response.text}")
+-                response.raise_for_status()
+-
+-            data = response.json()
+-            content = data["choices"][0]["message"]["content"]
+-            finish_reason = data["choices"][0].get("finish_reason")
+-
+-            if finish_reason == "length":
+-                print("[LLM] WARNING: response truncated by max_tokens (finish_reason=length).")
+-
+-            print("\n" + "=" * 70)
+-            print("[LLM] Full raw response:")
+-            print("=" * 70)
+-            print(content)
+-            print("=" * 70 + "\n")
+-
+-            result = extract_json(content)
+-
+-            if "overall" not in result:
+-                scores = [
+-                    float(result.get("fluency", 6.0)),
+-                    float(result.get("lexical", 6.0)),
+-                    float(result.get("grammar", 6.0)),
+-                    float(result.get("pronunciation", 6.0)),
+-                ]
+-                avg = sum(scores) / 4
+-                result["overall"] = round(avg * 2) / 2
+-
+-            print("\n[LLM FINAL SCORES]")
+-            print(json.dumps(result, indent=2))
+-            print("=" * 70 + "\n")
++        grammar_lexis = await _analyze_grammar_lexis(segments)
++    except Exception as e:
++        print(f"[LLM Scorer] Grammar/lexis pass failed: {type(e).__name__}: {e}")
++        grammar_lexis = _FALLBACK_ANALYSIS
++
++    try:
++        fluency = await _analyze_fluency(segments)
++    except Exception as e:
++        print(f"[LLM Scorer] Fluency pass failed: {type(e).__name__}: {e}")
++        fluency = _FALLBACK_ANALYSIS
++
++    try:
++        pronunciation = await _analyze_pronunciation(segments)
++    except Exception as e:
++        print(f"[LLM Scorer] Pronunciation pass failed: {type(e).__name__}: {e}")
++        pronunciation = _FALLBACK_ANALYSIS
++
++    try:
++        result = await _final_scoring(grammar_lexis, fluency, pronunciation, missing_note)
++
++        if "overall" not in result:
++            scores = [
++                float(result.get("fluency", 6.0)),
++                float(result.get("lexical", 6.0)),
++                float(result.get("grammar", 6.0)),
++                float(result.get("pronunciation", 6.0)),
++            ]
++            result["overall"] = round((sum(scores) / 4) * 2) / 2
++
++        # Keep the full per-pass findings alongside the final scores -- not
++        # shown in the app today, but valuable for debugging score
++        # justifications and for the future training dataset.
++        result.setdefault("evidence", {})
++        result["evidence"]["detailedAnalysis"] = {
++            "grammarLexis": grammar_lexis,
++            "fluency": fluency,
++            "pronunciation": pronunciation,
++        }
++
++        print("\n[LLM FINAL SCORES]")
++        print(json.dumps({k: v for k, v in result.items() if k != "evidence"}, indent=2))
++        print("=" * 70 + "\n")
+ 
+-            return result
++        return result
+ 
+     except Exception as e:
+-        print(f"[LLM Scorer] Error: {type(e).__name__}: {e}")
++        print(f"[LLM Scorer] Final scoring pass failed: {type(e).__name__}: {e}")
+         return {
+             "fluency": 6.5,
+             "lexical": 6.0,
+@@ -236,4 +381,4 @@
+                 "pronunciation": "Fallback due to LLM error",
+                 "per_part_feedback": [],
+             },
+-        }
+\ No newline at end of file
++        }

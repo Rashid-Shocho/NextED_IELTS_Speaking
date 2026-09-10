@@ -1,0 +1,313 @@
+diff -ruN a/app/core/config.py b/app/core/config.py
+--- a/app/core/config.py	2026-08-30 08:47:35.614088170 +0000
++++ b/app/core/config.py	2026-08-30 08:47:35.620819939 +0000
+@@ -31,6 +31,13 @@
+     # queue behind each other past any reasonable client timeout. Caps how
+     # many segments' RunPod calls run at once; the rest wait their turn.
+     RUNPOD_MAX_CONCURRENT: int = 3
++    # RunPod's deployed handler hard-rejects audio over MAX_AUDIO_SECONDS=100
++    # (returns status=FAILED, not a graceful trim). Part 2 allows up to 120s
++    # of speech, which can exceed that. Real fix is raising the cap on the
++    # RunPod worker itself and redeploying; this is a client-side safety net
++    # so a submission never silently loses all pronunciation data over it in
++    # the meantime. Kept a few seconds under 100 for encoding overhead.
++    RUNPOD_MAX_AUDIO_SECONDS: float = 95.0
+ 
+     # Cloudflare R2 (S3-compatible) -- archives every submitted audio clip
+     # for the future training dataset (speaking_training_samples). All
+diff -ruN a/app/services/llm_scorer.py b/app/services/llm_scorer.py
+--- a/app/services/llm_scorer.py	2026-08-30 08:47:35.614731329 +0000
++++ b/app/services/llm_scorer.py	2026-08-30 08:47:35.621392991 +0000
+@@ -1,3 +1,4 @@
++import asyncio
+ import json
+ import re
+ import httpx
+@@ -45,10 +46,13 @@
+     raise ValueError("Could not extract valid JSON from model response")
+ 
+ 
+-async def _call_groq_json(system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000) -> dict:
++async def _call_groq_json(
++    system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000, _is_retry: bool = False,
++) -> dict:
+     """
+     Shared plumbing for every scoring pass: call Groq, log input/output,
+-    parse JSON. Raises on any failure -- callers decide how to degrade.
++    parse JSON. Raises on any failure (after one retry for 429s) --
++    callers decide how to degrade.
+     """
+     headers = {
+         "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+@@ -62,11 +66,34 @@
+         ],
+         "temperature": 0.1,
+         "max_tokens": max_tokens,
++        # gpt-oss models "think" internally before producing visible output,
++        # and that reasoning consumes completion tokens from the same
++        # max_tokens budget as the final JSON -- at the default "medium"
++        # effort this can burn the whole budget on reasoning and truncate
++        # before any JSON is ever emitted (seen in production: empty
++        # response + finish_reason=length). "low" leaves enough budget for
++        # actual output on tasks this size, and meaningfully cuts total
++        # token usage across the 3 sequential passes per session.
++        "reasoning_effort": "low",
+     }
+ 
+     async with httpx.AsyncClient(timeout=90.0) as client:
+         print(f"[LLM:{label}] Calling model: {settings.GROQ_LLM_MODEL}")
+         response = await client.post(GROQ_URL, headers=headers, json=payload)
++
++        if response.status_code == 429 and not _is_retry:
++            wait_s = 10.0
++            try:
++                msg = response.json().get("error", {}).get("message", "")
++                m = re.search(r"try again in ([\d.]+)s", msg)
++                if m:
++                    wait_s = float(m.group(1)) + 1.0
++            except Exception:
++                pass
++            print(f"[LLM:{label}] Rate limited, waiting {wait_s:.1f}s and retrying once")
++            await asyncio.sleep(wait_s)
++            return await _call_groq_json(system_prompt, user_prompt, label, max_tokens, _is_retry=True)
++
+         if response.status_code != 200:
+             print(f"[LLM:{label}] Error {response.status_code}: {response.text}")
+             response.raise_for_status()
+@@ -133,35 +160,12 @@
+     return flat
+ 
+ 
+-# ---------- Pass A: Grammar & Lexical Resource (must quote the transcript) ----------
+-
+-async def _analyze_grammar_lexis(segments: list) -> dict:
+-    transcripts_block = "\n\n".join(
+-        f"[{seg.get('label', seg.get('segment_id',''))}] (Part {seg['part_number']})\n{seg['transcript']}"
+-        for seg in segments if seg.get("transcript")
+-    )
+-
+-    system_prompt = """You analyze IELTS Speaking transcripts for grammar and vocabulary evidence.
+-
+-CRITICAL RULE: every entry you list MUST include an exact quote copied from the transcript below -- not a paraphrase, not a made-up example. If you cannot find a real example in the text, do not invent one; simply list fewer entries.
+-
+-Reply with ONLY this JSON structure, no markdown, no extra text:
+-{
+-  "grammar_errors": [{"quote": "exact words from transcript", "issue": "what's wrong", "correction": "corrected version"}],
+-  "grammar_strengths": [{"quote": "exact words", "note": "why this shows good control, e.g. accurate complex conditional"}],
+-  "vocabulary_strengths": [{"quote": "exact words", "note": "why this is a strong lexical choice"}],
+-  "vocabulary_issues": [{"quote": "exact words", "issue": "e.g. repetition, wrong register, imprecise word choice"}]
+-}
+-List up to 6 grammar_errors, 3 grammar_strengths, 3 vocabulary_strengths, 4 vocabulary_issues. Fewer is fine if the transcript doesn't support more genuine examples."""
+-
+-    user_prompt = f"Transcripts:\n\n{transcripts_block}\n\nReturn only the JSON object."
+-
+-    return await _call_groq_json(system_prompt, user_prompt, label="grammar_lexis")
++# ---------- Pass A: Grammar, Lexis & Fluency (must quote the transcript) ----------
++# Merged into one call: both need the same transcript+timing input, and
++# sending transcripts twice (once per pass) was a meaningful chunk of the
++# token usage causing Groq TPM rate-limit failures on longer sessions.
+ 
+-
+-# ---------- Pass B: Fluency & Coherence (quantitative + quoted moments) ----------
+-
+-async def _analyze_fluency(segments: list) -> dict:
++async def _analyze_text(segments: list) -> dict:
+     blocks = []
+     for seg in segments:
+         if not seg.get("transcript"):
+@@ -173,26 +177,32 @@
+         )
+     combined = "\n\n".join(blocks)
+ 
+-    system_prompt = """You analyze IELTS Speaking fluency and coherence using BOTH the timing
+-data provided (speech_rate_wpm, articulation_rate_wpm, phonation_time_ratio, pause_count,
+-pause_total_sec) AND the transcript text.
+-
+-CRITICAL RULE: every fluency_observations entry MUST quote an exact moment from the transcript
+-(a filler, a repeated phrase, a self-correction, an incomplete/run-on sentence) -- not a paraphrase.
++    system_prompt = """You analyze IELTS Speaking transcripts for grammar, vocabulary, fluency and
++coherence evidence, using both the transcript text and the timing data provided (speech_rate_wpm,
++articulation_rate_wpm, phonation_time_ratio, pause_count, pause_total_sec).
++
++CRITICAL RULE: every entry you list MUST include an exact quote copied from the transcript below --
++not a paraphrase, not a made-up example. If you cannot find a real example in the text, do not
++invent one; simply list fewer entries.
+ 
+ Reply with ONLY this JSON structure, no markdown, no extra text:
+ {
++  "grammar_errors": [{"quote": "exact words from transcript", "issue": "what's wrong", "correction": "corrected version"}],
++  "grammar_strengths": [{"quote": "exact words", "note": "why this shows good control, e.g. accurate complex conditional"}],
++  "vocabulary_strengths": [{"quote": "exact words", "note": "why this is a strong lexical choice"}],
++  "vocabulary_issues": [{"quote": "exact words", "issue": "e.g. repetition, wrong register, imprecise word choice"}],
+   "fluency_observations": [{"label": "segment label", "quote": "exact words", "pattern": "filler | run-on | self-correction | repetition | incomplete-thought"}],
+   "quantitative_note": "1-2 sentences synthesizing the timing numbers across segments (e.g. consistent ~115wpm, moderate pausing, one notably slower segment)"
+ }
+-List up to 6 fluency_observations."""
++List up to 6 grammar_errors, 3 grammar_strengths, 3 vocabulary_strengths, 4 vocabulary_issues,
++6 fluency_observations. Fewer is fine if the transcript doesn't support more genuine examples."""
+ 
+-    user_prompt = f"Segments:\n\n{combined}\n\nReturn only the JSON object."
++    user_prompt = f"Transcripts:\n\n{combined}\n\nReturn only the JSON object."
+ 
+-    return await _call_groq_json(system_prompt, user_prompt, label="fluency")
++    return await _call_groq_json(system_prompt, user_prompt, label="text_analysis", max_tokens=2500)
+ 
+ 
+-# ---------- Pass C: Pronunciation (filter artifacts from genuine issues) ----------
++# ---------- Pass B: Pronunciation (filter artifacts from genuine issues) ----------
+ 
+ async def _analyze_pronunciation(segments: list) -> dict:
+     blocks = []
+@@ -228,7 +238,7 @@
+ 
+ # ---------- Pass D: Final scoring, anchored to real band descriptors ----------
+ 
+-async def _final_scoring(grammar_lexis: dict, fluency: dict, pronunciation: dict, missing_note: str) -> dict:
++async def _final_scoring(text_analysis: dict, pronunciation: dict, missing_note: str) -> dict:
+     descriptor_block = format_descriptor_block([4, 5, 6, 7, 8])
+ 
+     system_prompt = f"""You are an expert IELTS Speaking examiner assigning final band scores.
+@@ -270,11 +280,8 @@
+ 
+     user_prompt = f"""ANALYST FINDINGS:
+ 
+---- Grammar & Lexical Resource ---
+-{json.dumps(grammar_lexis, indent=2)}
+-
+---- Fluency & Coherence ---
+-{json.dumps(fluency, indent=2)}
++--- Grammar, Lexical Resource, Fluency & Coherence ---
++{json.dumps(text_analysis, indent=2)}
+ 
+ --- Pronunciation ---
+ {json.dumps(pronunciation, indent=2)}
+@@ -319,16 +326,10 @@
+     )
+ 
+     try:
+-        grammar_lexis = await _analyze_grammar_lexis(segments)
+-    except Exception as e:
+-        print(f"[LLM Scorer] Grammar/lexis pass failed: {type(e).__name__}: {e}")
+-        grammar_lexis = _FALLBACK_ANALYSIS
+-
+-    try:
+-        fluency = await _analyze_fluency(segments)
++        text_analysis = await _analyze_text(segments)
+     except Exception as e:
+-        print(f"[LLM Scorer] Fluency pass failed: {type(e).__name__}: {e}")
+-        fluency = _FALLBACK_ANALYSIS
++        print(f"[LLM Scorer] Text analysis pass failed: {type(e).__name__}: {e}")
++        text_analysis = _FALLBACK_ANALYSIS
+ 
+     try:
+         pronunciation = await _analyze_pronunciation(segments)
+@@ -337,7 +338,7 @@
+         pronunciation = _FALLBACK_ANALYSIS
+ 
+     try:
+-        result = await _final_scoring(grammar_lexis, fluency, pronunciation, missing_note)
++        result = await _final_scoring(text_analysis, pronunciation, missing_note)
+ 
+         if "overall" not in result:
+             scores = [
+@@ -353,8 +354,7 @@
+         # justifications and for the future training dataset.
+         result.setdefault("evidence", {})
+         result["evidence"]["detailedAnalysis"] = {
+-            "grammarLexis": grammar_lexis,
+-            "fluency": fluency,
++            "textAnalysis": text_analysis,
+             "pronunciation": pronunciation,
+         }
+ 
+diff -ruN a/app/services/pronunciation.py b/app/services/pronunciation.py
+--- a/app/services/pronunciation.py	2026-08-30 08:47:35.614619010 +0000
++++ b/app/services/pronunciation.py	2026-08-30 08:47:35.621305619 +0000
+@@ -71,14 +71,11 @@
+ }
+ 
+ 
+-def _transcode_to_wav_bytes(input_bytes: bytes) -> bytes:
++def _decode_trim_encode_wav(input_bytes: bytes, max_seconds: float) -> tuple[bytes, bool]:
+     """
+-    RunPod's handler only accepts wav/mp3/m4a/ogg/flac -- browser
+-    MediaRecorder output (webm/opus) isn't in that list. Rather than
+-    rejecting it, decode with PyAV (bundles its own ffmpeg libs, no
+-    system PATH dependency -- see vad.py for the same pattern) and
+-    re-encode as a standard 16kHz mono WAV file via the stdlib `wave`
+-    module.
++    Decodes any input format via PyAV, trims to max_seconds if longer (RunPod
++    hard-rejects audio over its own MAX_AUDIO_SECONDS instead of trimming
++    itself), and re-encodes as 16kHz mono WAV. Returns (wav_bytes, was_trimmed).
+     """
+     container = av.open(io.BytesIO(input_bytes))
+     resampler = av.AudioResampler(format="s16", layout="mono", rate=TARGET_SR)
+@@ -94,10 +91,15 @@
+         container.close()
+ 
+     if not pcm_chunks:
+-        raise RuntimeError("PyAV decoded 0 audio frames while transcoding for RunPod")
++        raise RuntimeError("PyAV decoded 0 audio frames")
+ 
+     pcm_bytes = b"".join(pcm_chunks)
+ 
++    max_bytes = int(max_seconds * TARGET_SR) * 2  # 16-bit PCM = 2 bytes/sample
++    was_trimmed = len(pcm_bytes) > max_bytes
++    if was_trimmed:
++        pcm_bytes = pcm_bytes[:max_bytes]
++
+     wav_buffer = io.BytesIO()
+     with wave.open(wav_buffer, "wb") as wf:
+         wf.setnchannels(1)
+@@ -105,7 +107,7 @@
+         wf.setframerate(TARGET_SR)
+         wf.writeframes(pcm_bytes)
+ 
+-    return wav_buffer.getvalue()
++    return wav_buffer.getvalue(), was_trimmed
+ 
+ 
+ async def _load_audio_b64_and_format(audio_url: str) -> tuple[str, str]:
+@@ -115,6 +117,12 @@
+     name for now since that's what the rest of the pipeline calls it --
+     despite the name, it's treated as a local file path here.
+ 
++    Always decodes+re-encodes to WAV via PyAV, regardless of the original
++    format -- this guarantees RunPod's MAX_AUDIO_SECONDS cap is enforced
++    client-side too (see settings.RUNPOD_MAX_AUDIO_SECONDS), rather than
++    only handling the "wrong format" case and letting long clips through
++    to fail server-side.
++
+     TODO: once audio is hosted somewhere RunPod's workers can reach
+     (S3/Cloudflare R2/presigned URL), send {"audio_url": ...} directly
+     instead of reading+base64-encoding, and skip this function entirely.
+@@ -125,20 +133,18 @@
+     if not local_path.exists():
+         raise FileNotFoundError(f"Local audio file not found: {local_path}")
+ 
+-    audio_format = local_path.suffix.lstrip(".").lower() or "wav"
+     raw_bytes = local_path.read_bytes()
++    wav_bytes, was_trimmed = _decode_trim_encode_wav(raw_bytes, settings.RUNPOD_MAX_AUDIO_SECONDS)
+ 
+-    if audio_format not in ALLOWED_AUDIO_FORMATS:
+-        # e.g. webm/opus from the browser -- RunPod's handler rejects these
+-        # outright, so transcode to WAV here instead of failing the part.
+-        print(f"[Pronunciation] '{audio_format}' not accepted by RunPod, transcoding to wav via PyAV")
+-        audio_bytes = _transcode_to_wav_bytes(raw_bytes)
+-        audio_format = "wav"
+-    else:
+-        audio_bytes = raw_bytes
++    if was_trimmed:
++        print(
++            f"[Pronunciation] Audio exceeded {settings.RUNPOD_MAX_AUDIO_SECONDS}s cap, "
++            f"trimmed before sending to RunPod (raise MAX_AUDIO_SECONDS on the RunPod "
++            f"worker + redeploy to fix properly instead of trimming)"
++        )
+ 
+-    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+-    return audio_b64, audio_format
++    audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
++    return audio_b64, "wav"
+ 
+ 
+ async def analyze_pronunciation(audio_url: str, reference_text: str) -> dict:

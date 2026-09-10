@@ -1,13 +1,31 @@
 """
 End-to-end smoke test against a running server (uvicorn app.main:app).
 Exercises: create session -> trigger evaluate -> poll -> report.
-Run: python tests/test_pipeline.py
+Run: python test_pipeline.py
+
+Requires the server's .env INTERNAL_API_KEY to also be set in THIS
+environment (or just paste it into API_KEY below) -- every /sessions/*
+route now requires it as the X-Internal-Api-Key header.
 """
 
+import os
 import time
+
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BASE_URL = "http://127.0.0.1:8000"
+API_KEY = os.getenv("INTERNAL_API_KEY")
+
+if not API_KEY:
+    raise SystemExit(
+        "INTERNAL_API_KEY not found in .env. Add it (same value the server "
+        "is running with) before running this test."
+    )
+
+HEADERS = {"X-Internal-Api-Key": API_KEY}
 
 payload = {
     "user_id": "test_user_1",
@@ -32,7 +50,7 @@ payload = {
 
 
 def main():
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, headers=HEADERS) as client:
         print("1) Creating session...")
         resp = client.post(f"{BASE_URL}/sessions", json=payload)
         resp.raise_for_status()
@@ -46,7 +64,7 @@ def main():
         print(f"   {resp.json()}")
 
         print("3) Polling session status...")
-        for i in range(80):          # was 30 -- 80 * 3s = 240s, enough for RunPod cold start
+        for i in range(80):          # 80 * 3s = 240s, enough for RunPod cold start
             time.sleep(3)
             resp = client.get(f"{BASE_URL}/sessions/{session_id}")
             resp.raise_for_status()
@@ -72,3 +90,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

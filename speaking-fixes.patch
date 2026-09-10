@@ -1,0 +1,486 @@
+diff --git a/.env.example b/.env.example
+index d7bb0ba..578486b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -12,6 +12,12 @@ RUNPOD_PRONUNCIATION_URL=https://api.runpod.ai/v2/xleyv5ilspgpbp/runsync
+ # and put the SAME value in the Next.js app's SPEAKING_API_KEY.
+ INTERNAL_API_KEY=
+ 
++# Comma-separated list of origins allowed to call this service from a
++# browser. Defaults to http://localhost:3000 for local dev -- MUST be set
++# to your deployed Next.js domain(s) before going live, e.g.:
++#   ALLOWED_ORIGINS=https://beta.yourapp.com
++ALLOWED_ORIGINS=http://localhost:3000
++
+ # Cloudflare R2 (S3-compatible) -- optional. If left blank, audio archival
+ # to R2 is skipped entirely and speaking_training_samples simply won't get
+ # populated -- everything else keeps working exactly as before.
+diff --git a/app/core/config.py b/app/core/config.py
+index 43a96cf..4949e2f 100644
+--- a/app/core/config.py
++++ b/app/core/config.py
+@@ -12,12 +12,29 @@ class Settings(BaseSettings):
+     # the only thing stopping a random caller from burning Groq/RunPod quota.
+     INTERNAL_API_KEY: str
+ 
++    # Comma-separated list of origins allowed to call this service directly
++    # from a browser (should just be the deployed Next.js app's origin(s) --
++    # this is server-to-server otherwise). Defaults to localhost for local
++    # dev; MUST be overridden in the deployed env or the beta frontend won't
++    # be able to reach this service at all.
++    ALLOWED_ORIGINS: str = "http://localhost:3000"
++
+     # Models
+     GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
+     GROQ_LLM_MODEL: str = "openai/gpt-oss-20b"
+     HF_EMBEDDING_MODEL: str = "BAAI/bge-base-en-v1.5"
+     EMBEDDING_DIM: int = 768
+ 
++    # Retry policy for transient failures against Groq (ASR) and RunPod
++    # (pronunciation). Both services fail this many times before the part
++    # is marked "failed" and surfaced to the user -- see asr.py /
++    # pronunciation.py. Kept small: this is beta-safety against blips, not
++    # a substitute for fixing a service that's actually down.
++    TRANSCRIBE_MAX_ATTEMPTS: int = 3
++    TRANSCRIBE_RETRY_BACKOFF_SEC: float = 2.0
++    PRONUNCIATION_MAX_ATTEMPTS: int = 2
++    PRONUNCIATION_RETRY_BACKOFF_SEC: float = 3.0
++
+     # ffmpeg (see app/services/vad.py)
+     FFMPEG_PATH: str = "ffmpeg"
+ 
+@@ -66,6 +83,10 @@ class Settings(BaseSettings):
+             and self.R2_SECRET_ACCESS_KEY and self.R2_BUCKET_NAME
+         )
+ 
++    @property
++    def allowed_origins_list(self) -> list[str]:
++        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
++
+ 
+ @lru_cache
+ def get_settings() -> Settings:
+diff --git a/app/main.py b/app/main.py
+index 40289a4..1af9d3f 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -24,11 +24,12 @@ app = FastAPI(
+ )
+ 
+ # Only the Next.js server calls this service directly (server-to-server),
+-# so CORS doesn't need to be wide open. Restrict to known origins; add your
+-# deployed Next.js domain here when you deploy.
++# so CORS doesn't need to be wide open. Restrict to known origins, read from
++# ALLOWED_ORIGINS env var (comma-separated) -- set this to the deployed
++# Next.js domain before going live. Defaults to localhost for local dev.
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["http://localhost:3000"],
++    allow_origins=settings.allowed_origins_list,
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+diff --git a/app/services/asr.py b/app/services/asr.py
+index 4935870..a599601 100644
+--- a/app/services/asr.py
++++ b/app/services/asr.py
+@@ -1,8 +1,74 @@
++import asyncio
++import logging
++
+ import httpx
+ from pathlib import Path
+ from app.core.config import get_settings
+ 
+ settings = get_settings()
++logger = logging.getLogger("asr")
++
++
++class TranscriptionError(RuntimeError):
++    """Raised when transcription fails after all retry attempts. The
++    caller (graph/nodes.py transcribe_node) is expected to let this
++    propagate -- it becomes a part status='failed' + error_reason, which
++    evaluate_session's outer try/except turns into session status='failed'
++    with a real error_message, instead of silently scoring the user
++    against a fabricated transcript."""
++
++
++async def _load_audio_bytes(audio_url: str) -> bytes:
++    # ---------- 1. Local file ----------
++    if not audio_url.startswith(("http://", "https://")):
++        local_path = Path(audio_url)
++        if not local_path.is_absolute():
++            local_path = Path.cwd() / audio_url
++
++        if not local_path.exists():
++            raise FileNotFoundError(f"Local audio file not found: {local_path}")
++
++        logger.info("Reading local file: %s", local_path)
++        audio_bytes = local_path.read_bytes()
++        logger.info("Loaded %d bytes from local file", len(audio_bytes))
++        return audio_bytes
++
++    # ---------- 2. Remote URL ----------
++    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
++        logger.info("Downloading audio from: %s", audio_url)
++        audio_response = await client.get(audio_url)
++        audio_response.raise_for_status()
++        audio_bytes = audio_response.content
++        logger.info("Downloaded %d bytes", len(audio_bytes))
++        return audio_bytes
++
++
++async def _transcribe_once(audio_bytes: bytes) -> dict:
++    headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}"}
++
++    async with httpx.AsyncClient(timeout=90.0) as client:
++        files = {
++            "file": ("audio.m4a", audio_bytes, "audio/mp4"),  # m4a works
++            "model": (None, settings.GROQ_WHISPER_MODEL),
++            "response_format": (None, "verbose_json"),
++            "timestamp_granularities[]": (None, "word"),
++        }
++
++        response = await client.post(
++            "https://api.groq.com/openai/v1/audio/transcriptions",
++            headers=headers,
++            files=files,
++        )
++        response.raise_for_status()
++        data = response.json()
++
++        words = [
++            {"word": w.get("word", ""), "start": w.get("start", 0), "end": w.get("end", 0)}
++            for w in (data.get("words", []) or [])
++        ]
++        transcript = data.get("text", "").strip()
++        logger.info("Transcription success - %d chars", len(transcript))
++        return {"transcript": transcript, "words": words}
+ 
+ 
+ async def transcribe_audio(audio_url: str) -> dict:
+@@ -11,87 +77,28 @@ async def transcribe_audio(audio_url: str) -> dict:
+     Supports:
+       1. Remote URLs (http/https)
+       2. Local file paths (e.g. audio_samples/audio1.m4a)
++
++    Retries transient failures (network blips, Groq rate limits/5xx) up to
++    TRANSCRIBE_MAX_ATTEMPTS times. If every attempt fails, raises
++    TranscriptionError instead of silently returning placeholder text --
++    a failed transcription must never be scored as if it were real.
+     """
+-    headers = {
+-        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+-    }
+-
+-    try:
+-        audio_bytes = None
+-
+-        # ---------- 1. Local file ----------
+-        if not audio_url.startswith(("http://", "https://")):
+-            local_path = Path(audio_url)
+-            if not local_path.is_absolute():
+-                # Try relative to project root
+-                local_path = Path.cwd() / audio_url
+-
+-            if not local_path.exists():
+-                raise FileNotFoundError(f"Local audio file not found: {local_path}")
+-
+-            print(f"[ASR] Reading local file: {local_path}")
+-            audio_bytes = local_path.read_bytes()
+-            print(f"[ASR] Loaded {len(audio_bytes)} bytes from local file")
+-
+-        # ---------- 2. Remote URL ----------
+-        else:
+-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+-                print(f"[ASR] Downloading audio from: {audio_url}")
+-                audio_response = await client.get(audio_url)
+-                audio_response.raise_for_status()
+-                audio_bytes = audio_response.content
+-                print(f"[ASR] Downloaded {len(audio_bytes)} bytes")
+-
+-        # ---------- Send to Groq Whisper ----------
+-        async with httpx.AsyncClient(timeout=90.0) as client:
+-            files = {
+-                "file": ("audio.m4a", audio_bytes, "audio/mp4"),  # m4a works
+-                "model": (None, settings.GROQ_WHISPER_MODEL),
+-                "response_format": (None, "verbose_json"),
+-                "timestamp_granularities[]": (None, "word"),
+-            }
+-
+-            response = await client.post(
+-                "https://api.groq.com/openai/v1/audio/transcriptions",
+-                headers=headers,
+-                files=files,
++    audio_bytes = await _load_audio_bytes(audio_url)
++
++    last_error: Exception | None = None
++    for attempt in range(1, settings.TRANSCRIBE_MAX_ATTEMPTS + 1):
++        try:
++            return await _transcribe_once(audio_bytes)
++        except Exception as e:
++            last_error = e
++            logger.warning(
++                "Transcription attempt %d/%d failed (%s: %s)",
++                attempt, settings.TRANSCRIBE_MAX_ATTEMPTS, type(e).__name__, e,
+             )
+-            response.raise_for_status()
+-            data = response.json()
+-
+-            words = []
+-            for w in data.get("words", []) or []:
+-                words.append({
+-                    "word": w.get("word", ""),
+-                    "start": w.get("start", 0),
+-                    "end": w.get("end", 0),
+-                })
+-
+-            transcript = data.get("text", "").strip()
+-            print(f"[ASR] Success – transcript length: {len(transcript)} chars")
+-            return {
+-                "transcript": transcript,
+-                "words": words,
+-            }
+-
+-    except Exception as e:
+-        print(f"[ASR] Error: {type(e).__name__}: {e}")
+-        print("[ASR] Using realistic mock transcript for demo...")
+-
+-        # Fallback so the rest of the pipeline still works
+-        return {
+-            "transcript": (
+-                "I am currently a university student majoring in computer science. "
+-                "I chose this field because I have always been interested in technology "
+-                "and how it can solve real-world problems. In the future I hope to work "
+-                "as a software engineer in a company that focuses on artificial intelligence."
+-            ),
+-            "words": [
+-                {"word": "I", "start": 0.0, "end": 0.2},
+-                {"word": "am", "start": 0.2, "end": 0.4},
+-                {"word": "currently", "start": 0.4, "end": 0.8},
+-                {"word": "a", "start": 0.8, "end": 0.9},
+-                {"word": "university", "start": 0.9, "end": 1.4},
+-                {"word": "student", "start": 1.4, "end": 1.9},
+-            ],
+-        }
+\ No newline at end of file
++            if attempt < settings.TRANSCRIBE_MAX_ATTEMPTS:
++                await asyncio.sleep(settings.TRANSCRIBE_RETRY_BACKOFF_SEC * attempt)
++
++    raise TranscriptionError(
++        f"Transcription failed after {settings.TRANSCRIBE_MAX_ATTEMPTS} attempts: "
++        f"{type(last_error).__name__}: {last_error}"
++    ) from last_error
+diff --git a/app/services/pronunciation.py b/app/services/pronunciation.py
+index 781ee5a..666fe30 100644
+--- a/app/services/pronunciation.py
++++ b/app/services/pronunciation.py
+@@ -18,6 +18,7 @@ Two things the RunPod handler requires that this must supply:
+ import asyncio
+ import base64
+ import io
++import logging
+ import re
+ import wave
+ from pathlib import Path
+@@ -29,6 +30,14 @@ from app.core.config import get_settings
+ from app.services.pronunciation_parser import analyze_gop_result
+ 
+ settings = get_settings()
++logger = logging.getLogger("pronunciation")
++
++
++class PronunciationError(RuntimeError):
++    """Raised when pronunciation scoring fails after all retry attempts.
++    Left to propagate -- becomes part status='failed', which surfaces to
++    the user as a real error instead of a silently empty pronunciation
++    score baked into their band average."""
+ 
+ ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "m4a", "ogg", "flac"}
+ TARGET_SR = 16000
+@@ -147,6 +156,74 @@ async def _load_audio_b64_and_format(audio_url: str) -> tuple[str, str]:
+     return audio_b64, "wav"
+ 
+ 
++async def _analyze_pronunciation_once(audio_b64: str, audio_format: str, reference_text: str) -> dict:
++    headers = {
++        "Authorization": f"Bearer {settings.RUNPOD_API_KEY}",
++        "Content-Type": "application/json",
++    }
++
++    async with _get_runpod_semaphore():
++        # Long enough for RunPod to queue behind other concurrent
++        # segments AND cold-start a worker AND process up to ~90s of
++        # audio -- 60s was fine for one-off calls but not for several
++        # segments' worth of concurrent load.
++        async with httpx.AsyncClient(timeout=180.0) as client:
++            submit_resp = await client.post(
++                settings.RUNPOD_PRONUNCIATION_URL,
++                headers=headers,
++                json={
++                    "input": {
++                        "audio_base64": audio_b64,
++                        "audio_format": audio_format,
++                        "reference_text": reference_text,
++                    }
++                },
++            )
++            submit_resp.raise_for_status()
++            submit_data = submit_resp.json()
++
++            job_id = submit_data.get("id")
++            if not job_id:
++                raise ValueError(f"RunPod response had no job id: {submit_data}")
++
++            status = submit_data.get("status")
++            output = submit_data.get("output")
++
++            if status != "COMPLETED":
++                status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
++                elapsed = 0.0
++
++                while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
++                    await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
++                    elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
++
++                    poll_resp = await client.get(status_url, headers=headers)
++                    poll_resp.raise_for_status()
++                    poll_data = poll_resp.json()
++                    status = poll_data.get("status")
++
++                    logger.info("RunPod job %s status=%s (%.0fs)", job_id, status, elapsed)
++
++                    if status == "COMPLETED":
++                        output = poll_data.get("output")
++                        break
++                    if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
++                        raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
++                else:
++                    raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
++
++            if isinstance(output, dict) and output.get("error"):
++                raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
++
++            result = analyze_gop_result(output)
++            logger.info(
++                "%d phonemes, avg=%s, severe=%s, worst=%s",
++                result["total_phonemes"], result["utterance_avg"],
++                result["distribution"]["severe"], result["worst_phoneme"],
++            )
++            return result
++
++
+ async def analyze_pronunciation(audio_url: str, reference_text: str) -> dict:
+     """
+     audio_url: local file path (see _load_audio_b64_and_format's TODO to
+@@ -154,78 +231,37 @@ async def analyze_pronunciation(audio_url: str, reference_text: str) -> dict:
+     reference_text: the transcript to forced-align against (from
+                      transcribe_node -- pronunciation now runs after
+                      transcription, not in parallel with it).
++
++    Retries transient RunPod failures (queueing, cold starts, blips) up to
++    PRONUNCIATION_MAX_ATTEMPTS times. If every attempt fails, raises
++    PronunciationError instead of silently returning an empty/default
++    result -- a failed pronunciation pass must not be averaged into the
++    user's band score as if it were a real (if poor) score.
++
++    The one legitimate silent case is an empty transcript: with nothing to
++    forced-align against, there's genuinely nothing to score, so that
++    returns _DEFAULT_RESULT rather than erroring.
+     """
+     if not reference_text or not reference_text.strip():
+-        print("[Pronunciation] No reference_text (empty transcript) -- skipping RunPod call")
++        logger.info("No reference_text (empty transcript) -- skipping RunPod call")
+         return _DEFAULT_RESULT
+ 
+-    headers = {
+-        "Authorization": f"Bearer {settings.RUNPOD_API_KEY}",
+-        "Content-Type": "application/json",
+-    }
+-
+-    try:
+-        audio_b64, audio_format = await _load_audio_b64_and_format(audio_url)
+-
+-        async with _get_runpod_semaphore():
+-            # Long enough for RunPod to queue behind other concurrent
+-            # segments AND cold-start a worker AND process up to ~90s of
+-            # audio -- 60s was fine for one-off calls but not for several
+-            # segments' worth of concurrent load.
+-            async with httpx.AsyncClient(timeout=180.0) as client:
+-                submit_resp = await client.post(
+-                    settings.RUNPOD_PRONUNCIATION_URL,
+-                    headers=headers,
+-                    json={
+-                        "input": {
+-                            "audio_base64": audio_b64,
+-                            "audio_format": audio_format,
+-                            "reference_text": reference_text,
+-                        }
+-                    },
+-                )
+-                submit_resp.raise_for_status()
+-                submit_data = submit_resp.json()
+-
+-                job_id = submit_data.get("id")
+-                if not job_id:
+-                    raise ValueError(f"RunPod response had no job id: {submit_data}")
+-
+-                status = submit_data.get("status")
+-                output = submit_data.get("output")
+-
+-                if status != "COMPLETED":
+-                    status_url = _status_url(settings.RUNPOD_PRONUNCIATION_URL, job_id)
+-                    elapsed = 0.0
+-
+-                    while elapsed < settings.RUNPOD_POLL_TIMEOUT_SEC:
+-                        await asyncio.sleep(settings.RUNPOD_POLL_INTERVAL_SEC)
+-                        elapsed += settings.RUNPOD_POLL_INTERVAL_SEC
+-
+-                        poll_resp = await client.get(status_url, headers=headers)
+-                        poll_resp.raise_for_status()
+-                        poll_data = poll_resp.json()
+-                        status = poll_data.get("status")
+-
+-                        print(f"[Pronunciation] RunPod job {job_id} status={status} ({elapsed:.0f}s)")
+-
+-                        if status == "COMPLETED":
+-                            output = poll_data.get("output")
+-                            break
+-                        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+-                            raise RuntimeError(f"RunPod job {job_id} ended with status={status}: {poll_data}")
+-                    else:
+-                        raise TimeoutError(f"RunPod job {job_id} did not complete within {settings.RUNPOD_POLL_TIMEOUT_SEC}s")
+-
+-                if isinstance(output, dict) and output.get("error"):
+-                    raise RuntimeError(f"RunPod handler returned an error: {output['error']}")
+-
+-                result = analyze_gop_result(output)
+-                print(f"[Pronunciation] {result['total_phonemes']} phonemes, "
+-                      f"avg={result['utterance_avg']}, severe={result['distribution']['severe']}, "
+-                      f"worst={result['worst_phoneme']}")
+-                return result
+-
+-    except Exception as e:
+-        print(f"[Pronunciation] RunPod call failed ({type(e).__name__}: {e}), returning empty result")
+-        return _DEFAULT_RESULT
+\ No newline at end of file
++    audio_b64, audio_format = await _load_audio_b64_and_format(audio_url)
++
++    last_error: Exception | None = None
++    for attempt in range(1, settings.PRONUNCIATION_MAX_ATTEMPTS + 1):
++        try:
++            return await _analyze_pronunciation_once(audio_b64, audio_format, reference_text)
++        except Exception as e:
++            last_error = e
++            logger.warning(
++                "Pronunciation attempt %d/%d failed (%s: %s)",
++                attempt, settings.PRONUNCIATION_MAX_ATTEMPTS, type(e).__name__, e,
++            )
++            if attempt < settings.PRONUNCIATION_MAX_ATTEMPTS:
++                await asyncio.sleep(settings.PRONUNCIATION_RETRY_BACKOFF_SEC * attempt)
++
++    raise PronunciationError(
++        f"Pronunciation scoring failed after {settings.PRONUNCIATION_MAX_ATTEMPTS} attempts: "
++        f"{type(last_error).__name__}: {last_error}"
++    ) from last_error
+\ No newline at end of file

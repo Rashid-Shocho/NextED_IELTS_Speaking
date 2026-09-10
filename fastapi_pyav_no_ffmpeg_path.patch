@@ -1,0 +1,261 @@
+diff -ruN a/app/services/pronunciation.py b/app/services/pronunciation.py
+--- a/app/services/pronunciation.py	2026-08-29 07:37:05.171226979 +0000
++++ b/app/services/pronunciation.py	2026-08-29 07:37:05.177489473 +0000
+@@ -17,10 +17,12 @@
+ 
+ import asyncio
+ import base64
++import io
+ import re
+-import subprocess
++import wave
+ from pathlib import Path
+ 
++import av
+ import httpx
+ 
+ from app.core.config import get_settings
+@@ -29,6 +31,7 @@
+ settings = get_settings()
+ 
+ ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "m4a", "ogg", "flac"}
++TARGET_SR = 16000
+ 
+ 
+ def _status_url(run_url: str, job_id: str) -> str:
+@@ -44,37 +47,41 @@
+ }
+ 
+ 
+-def _transcode_to_wav_bytes(input_path: Path) -> bytes:
++def _transcode_to_wav_bytes(input_bytes: bytes) -> bytes:
+     """
+-    RunPod's handler (and the check just above this call site) only accepts
+-    wav/mp3/m4a/ogg/flac -- browser MediaRecorder output (webm/opus) isn't
+-    in that list. Rather than rejecting it, transcode to a standard 16kHz
+-    mono WAV with the same ffmpeg binary VAD already depends on (see
+-    vad.py's _decode_to_pcm16_mono_16k for the same pattern).
++    RunPod's handler only accepts wav/mp3/m4a/ogg/flac -- browser
++    MediaRecorder output (webm/opus) isn't in that list. Rather than
++    rejecting it, decode with PyAV (bundles its own ffmpeg libs, no
++    system PATH dependency -- see vad.py for the same pattern) and
++    re-encode as a standard 16kHz mono WAV file via the stdlib `wave`
++    module.
+     """
+-    proc = subprocess.run(
+-        [
+-            settings.FFMPEG_PATH,
+-            "-nostdin",
+-            "-hide_banner",
+-            "-loglevel", "warning",
+-            "-i", str(input_path),
+-            "-map", "0:a:0",
+-            "-vn",
+-            "-ac", "1",
+-            "-ar", "16000",
+-            "-f", "wav",
+-            "-acodec", "pcm_s16le",
+-            "pipe:1",
+-        ],
+-        capture_output=True,
+-    )
+-    if proc.returncode != 0:
+-        stderr_text = proc.stderr.decode(errors="ignore") if proc.stderr else ""
+-        raise RuntimeError(f"ffmpeg transcode to wav failed: {stderr_text[-800:]}")
+-    if not proc.stdout:
+-        raise RuntimeError("ffmpeg transcode produced no output")
+-    return proc.stdout
++    container = av.open(io.BytesIO(input_bytes))
++    resampler = av.AudioResampler(format="s16", layout="mono", rate=TARGET_SR)
++
++    pcm_chunks = []
++    try:
++        for frame in container.decode(audio=0):
++            for rframe in resampler.resample(frame):
++                pcm_chunks.append(rframe.to_ndarray().tobytes())
++        for rframe in resampler.resample(None):
++            pcm_chunks.append(rframe.to_ndarray().tobytes())
++    finally:
++        container.close()
++
++    if not pcm_chunks:
++        raise RuntimeError("PyAV decoded 0 audio frames while transcoding for RunPod")
++
++    pcm_bytes = b"".join(pcm_chunks)
++
++    wav_buffer = io.BytesIO()
++    with wave.open(wav_buffer, "wb") as wf:
++        wf.setnchannels(1)
++        wf.setsampwidth(2)  # 16-bit
++        wf.setframerate(TARGET_SR)
++        wf.writeframes(pcm_bytes)
++
++    return wav_buffer.getvalue()
+ 
+ 
+ async def _load_audio_b64_and_format(audio_url: str) -> tuple[str, str]:
+@@ -95,15 +102,16 @@
+         raise FileNotFoundError(f"Local audio file not found: {local_path}")
+ 
+     audio_format = local_path.suffix.lstrip(".").lower() or "wav"
++    raw_bytes = local_path.read_bytes()
+ 
+     if audio_format not in ALLOWED_AUDIO_FORMATS:
+         # e.g. webm/opus from the browser -- RunPod's handler rejects these
+         # outright, so transcode to WAV here instead of failing the part.
+-        print(f"[Pronunciation] '{audio_format}' not accepted by RunPod, transcoding to wav via ffmpeg")
+-        audio_bytes = _transcode_to_wav_bytes(local_path)
++        print(f"[Pronunciation] '{audio_format}' not accepted by RunPod, transcoding to wav via PyAV")
++        audio_bytes = _transcode_to_wav_bytes(raw_bytes)
+         audio_format = "wav"
+     else:
+-        audio_bytes = local_path.read_bytes()
++        audio_bytes = raw_bytes
+ 
+     audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+     return audio_b64, audio_format
+diff -ruN a/app/services/vad.py b/app/services/vad.py
+--- a/app/services/vad.py	2026-08-29 07:37:05.171289255 +0000
++++ b/app/services/vad.py	2026-08-29 07:37:05.177515869 +0000
+@@ -2,25 +2,24 @@
+ Silero VAD pass -- speech/silence segments, deliberately NOT Whisper's
+ word-level timestamps (see architecture doc, Section 4).
+ 
+-Decodes audio via the ffmpeg binary directly (subprocess) instead of
+-torchaudio.load(), which on recent torchaudio versions requires the
+-separate `torchcodec` package and is fragile to set up on Windows.
+-Uses settings.FFMPEG_PATH so it works whether ffmpeg is on PATH (Linux/
+-RunPod) or only reachable via an explicit path (Windows dev, e.g. via
+-ffmpeg-downloader).
++Decodes audio via PyAV (the `av` package), which bundles its own compiled
++ffmpeg libraries inside the wheel -- no system ffmpeg binary or PATH
++configuration required, which was a recurring pain point on Windows dev
++machines (previously shelled out to a system `ffmpeg` binary via
++subprocess, which depends on PATH/registry state being in sync with
++whatever process Python is running in).
+ 
+ Runs on the CPU-only orchestrator, not the RunPod GPU worker -- it's
+ signal processing, not a model-scoring call.
+ 
+-Fail-soft: if ffmpeg or Silero VAD aren't available, falls back to
++Fail-soft: if PyAV or Silero VAD aren't available, falls back to
+ assuming speech is present rather than blocking the pipeline in dev.
+ """
+ 
+-import tempfile
+-import os
+-import subprocess
++import io
+ from pathlib import Path
+ 
++import av
+ import httpx
+ import numpy as np
+ 
+@@ -64,51 +63,33 @@
+         return resp.content
+ 
+ 
+-
+ def _decode_to_pcm16_mono_16k(audio_bytes: bytes) -> np.ndarray:
+     """
+-    ffmpeg: any input format (m4a/mp3/wav/webm/opus) -> raw PCM16LE,
+-    mono, 16kHz. Written to a temp file first (not piped via stdin) --
+-    MP4/M4A containers can store their metadata (moov atom) at the end
+-    of the file, which requires a seekable input; a pipe isn't seekable
+-    and causes ffmpeg to fail with "partial file" / "Invalid data".
++    PyAV: any input container/codec (m4a/mp3/wav/webm+opus, etc.) -> PCM16
++    mono, 16kHz float32 samples in [-1, 1]. Works directly on in-memory
++    bytes -- no temp file, no subprocess, no system ffmpeg dependency.
+     """
+-    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+-        tmp.write(audio_bytes)
+-        tmp_path = tmp.name
++    container = av.open(io.BytesIO(audio_bytes))
++    resampler = av.AudioResampler(format="s16", layout="mono", rate=TARGET_SR)
+ 
++    chunks: list[np.ndarray] = []
+     try:
+-        proc = subprocess.run(
+-            [
+-                settings.FFMPEG_PATH,
+-                "-nostdin",
+-                "-hide_banner",
+-                "-loglevel", "warning",
+-                "-i", tmp_path,
+-                "-map", "0:a:0",
+-                "-vn",
+-                "-f", "s16le",
+-                "-acodec", "pcm_s16le",
+-                "-ac", "1",
+-                "-ar", str(TARGET_SR),
+-                "pipe:1",
+-            ],
+-            capture_output=True,
+-        )
++        for frame in container.decode(audio=0):
++            for rframe in resampler.resample(frame):
++                chunks.append(rframe.to_ndarray())
++        # flush any samples buffered inside the resampler
++        for rframe in resampler.resample(None):
++            chunks.append(rframe.to_ndarray())
+     finally:
+-        os.unlink(tmp_path)
+-
+-    stderr_text = proc.stderr.decode(errors="ignore") if proc.stderr else ""
+-
+-    if proc.returncode != 0:
+-        raise RuntimeError(f"ffmpeg exited {proc.returncode}: {stderr_text[-800:]}")
++        container.close()
+ 
+-    if not proc.stdout:
+-        raise RuntimeError(f"ffmpeg produced no output (exit 0). stderr: {stderr_text[-800:]}")
++    if not chunks:
++        raise RuntimeError("PyAV decoded 0 audio frames (empty/corrupt file, or unsupported codec)")
+ 
+-    pcm = np.frombuffer(proc.stdout, dtype=np.int16)
++    pcm = np.concatenate(chunks, axis=1).reshape(-1)  # s16 mono ndarray is shape (1, N)
+     return pcm.astype(np.float32) / 32768.0
+ 
++
+ async def detect_speech_segments(audio_url: str) -> dict:
+     """
+     Returns:
+@@ -127,7 +108,7 @@
+         samples = _decode_to_pcm16_mono_16k(audio_bytes)
+ 
+         if samples.size == 0:
+-            raise ValueError("ffmpeg produced 0 audio samples (decode failed or empty file)")
++            raise ValueError("PyAV produced 0 audio samples (decode failed or empty file)")
+ 
+         waveform = torch.from_numpy(samples)
+ 
+@@ -149,16 +130,6 @@
+             "total_duration_sec": round(total_duration, 2),
+         }
+ 
+-    except subprocess.CalledProcessError as e:
+-        stderr = e.stderr.decode(errors="ignore") if e.stderr else ""
+-        print(f"[VAD] ffmpeg decode failed: {stderr[-500:]}")
+-        print("[VAD] Falling back to assuming speech is present (dev fallback).")
+-        return {
+-            "has_speech": True,
+-            "segments": [{"start": 0.0, "end": 4.0}],
+-            "total_duration_sec": 4.0,
+-        }
+-
+     except Exception as e:
+         print(f"[VAD] Error: {type(e).__name__}: {e}")
+         print("[VAD] Falling back to assuming speech is present (dev fallback).")
+diff -ruN a/requirements.txt b/requirements.txt
+--- a/requirements.txt	2026-08-29 07:37:05.175249979 +0000
++++ b/requirements.txt	2026-08-29 07:37:05.181530661 +0000
+@@ -28,7 +28,7 @@
+ torch
+ torchaudio
+ numpy
+-ffmpeg-downloader
++av
+ 
+ # Utilities & Async Support
+ python-dotenv==1.2.3
