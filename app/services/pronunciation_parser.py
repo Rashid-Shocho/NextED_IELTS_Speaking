@@ -75,13 +75,24 @@ def analyze_gop_result(raw) -> dict:
     The main receiver function. Takes GOP output in any of the shapes
     described above and returns a compact, deduped, LLM-ready summary.
     """
-    phoneme_data = _normalize_input(raw)
+    raw_data = _normalize_input(raw)
+
+    # The real RunPod handler (unlike the notebook mock data this was
+    # originally built/tested against) can return a null score for a token
+    # it couldn't forced-align/score -- e.g. silence, a phoneme outside the
+    # acoustic model's inventory, or an alignment gap. That's "we have no
+    # opinion on this token", not "score 0" or a mispronunciation, so it
+    # must be excluded from the average/distribution/severe-flag math
+    # rather than counted or left to blow up sum()/comparisons below.
+    phoneme_data = [item for item in raw_data if item.get("score") is not None]
     total = len(phoneme_data)
+    unscored = len(raw_data) - total
 
     if total == 0:
         return {
             "utterance_avg": None,
             "total_phonemes": 0,
+            "unscored_phonemes": unscored,
             "distribution": {"excellent": 0, "good": 0, "moderate": 0, "severe": 0},
             "severe_flags": [],
             "worst_phoneme": None,
@@ -117,6 +128,7 @@ def analyze_gop_result(raw) -> dict:
     return {
         "utterance_avg": round(avg_score, 3),
         "total_phonemes": total,
+        "unscored_phonemes": unscored,
         "distribution": {
             "excellent": excellent,
             "good": good,

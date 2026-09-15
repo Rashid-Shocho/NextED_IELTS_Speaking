@@ -10,8 +10,56 @@ settings = get_settings()
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
+def _close_open_brackets(candidate: str) -> str:
+    """Walks a possibly-truncated/malformed JSON fragment (respecting
+    string/escape state so brackets inside quoted text aren't counted) and
+    appends whatever closing quote/]/} characters are needed to balance
+    everything still open. Used to salvage a response that got cut off, or
+    that went wrong partway through (e.g. the model closed an object with
+    ']' instead of '}'), rather than losing the whole response to one bad
+    character."""
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in candidate:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+
+    repaired = candidate
+    if in_string:
+        repaired += '"'
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
 def extract_json(text: str) -> dict:
-    """Very tolerant JSON extractor."""
+    """Very tolerant JSON extractor.
+
+    gpt-oss-20b via Groq occasionally emits JSON that's syntactically
+    broken in ways that aren't just "got cut off at the end" -- e.g. a
+    nested object closed with ']' instead of '}' partway through a long
+    array (seen in production on the text_analysis pass), or the whole
+    response missing its final closing '}' despite finish_reason not
+    being "length" (seen on final_scoring). A single-shot direct parse
+    fails on both, so on failure this walks the JSONDecodeError's exact
+    error position, cuts the string there, and re-closes whatever
+    strings/arrays/objects were still open at that point -- recovering
+    everything up to the break instead of discarding the whole response.
+    """
     text = text.strip()
 
     # Remove thinking tags
@@ -28,31 +76,49 @@ def extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Find the largest possible {...} block
+    # Find the first '{' onward (handles leading prose before the JSON),
+    # up through the largest possible closing '}' if there is one.
     match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        candidate = match.group(0)
+    candidate = match.group(0) if match else text[text.find("{"):] if "{" in text else text
+
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as e:
+        # Cut at the exact point parsing broke, trim any dangling trailing
+        # comma/colon left right at that cut, then close whatever was
+        # still open. Covers both "ran out of tokens mid-value" (cut
+        # point = end of string, nothing lost) and "malformed/wrong token
+        # mid-structure" (cut point = the bad token, so only content after
+        # it is lost, not the whole response).
+        truncated = re.sub(r'[,:\s]+$', "", candidate[: e.pos])
+        repaired = _close_open_brackets(truncated)
         try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            candidate = candidate.rstrip(", \n\r\t")
-            if not candidate.endswith("}"):
-                candidate += '"}]}'
-            try:
-                return json.loads(candidate)
-            except Exception:
-                pass
+            return json.loads(repaired)
+        except Exception:
+            pass
 
     raise ValueError("Could not extract valid JSON from model response")
 
 
 async def _call_groq_json(
-    system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000, _is_retry: bool = False,
+    system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000,
+    response_schema: dict | None = None, _is_retry: bool = False,
 ) -> dict:
     """
     Shared plumbing for every scoring pass: call Groq, log input/output,
     parse JSON. Raises on any failure (after one retry for 429s) --
     callers decide how to degrade.
+
+    response_schema, when given, is sent as a strict-mode JSON Schema via
+    `response_format` -- Groq's docs confirm openai/gpt-oss-20b (our
+    GROQ_LLM_MODEL) supports strict-mode structured outputs, which use
+    constrained decoding to guarantee the response matches the schema
+    exactly. This is the real fix for the malformed-JSON failures seen in
+    production (a nested object closed with ']' instead of '}', a
+    response missing its final '}') -- those were the model free-forming
+    JSON as text, not a parsing bug on our end. extract_json's repair
+    logic stays as a defense-in-depth fallback in case a future model
+    swap loses strict-mode support or Groq's guarantee has an edge case.
     """
     headers = {
         "Authorization": f"Bearer {settings.GROQ_API_KEY}",
@@ -76,6 +142,15 @@ async def _call_groq_json(
         # token usage across the 3 sequential passes per session.
         "reasoning_effort": "low",
     }
+    if response_schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": label,
+                "strict": True,
+                "schema": response_schema,
+            },
+        }
 
     async with httpx.AsyncClient(timeout=90.0) as client:
         print(f"[LLM:{label}] Calling model: {settings.GROQ_LLM_MODEL}")
@@ -92,7 +167,10 @@ async def _call_groq_json(
                 pass
             print(f"[LLM:{label}] Rate limited, waiting {wait_s:.1f}s and retrying once")
             await asyncio.sleep(wait_s)
-            return await _call_groq_json(system_prompt, user_prompt, label, max_tokens, _is_retry=True)
+            return await _call_groq_json(
+                system_prompt, user_prompt, label, max_tokens,
+                response_schema=response_schema, _is_retry=True,
+            )
 
         if response.status_code != 200:
             print(f"[LLM:{label}] Error {response.status_code}: {response.text}")
@@ -152,6 +230,124 @@ def _format_pronunciation_evidence(pron: dict) -> str:
     )
 
 
+# ---------- Strict-mode JSON schemas ----------
+# Groq's strict structured-output mode requires every property to be
+# listed in "required" (an empty list/string is how the model expresses
+# "found none/nothing to add" -- these fields were never truly optional
+# in the prompts above either) and every object to set
+# additionalProperties: False.
+
+_QUOTE_NOTE_SCHEMA = {
+    "type": "object",
+    "properties": {"quote": {"type": "string"}, "note": {"type": "string"}},
+    "required": ["quote", "note"],
+    "additionalProperties": False,
+}
+_QUOTE_ISSUE_SCHEMA = {
+    "type": "object",
+    "properties": {"quote": {"type": "string"}, "issue": {"type": "string"}},
+    "required": ["quote", "issue"],
+    "additionalProperties": False,
+}
+
+_TEXT_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grammar_errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "quote": {"type": "string"},
+                    "issue": {"type": "string"},
+                    "correction": {"type": "string"},
+                },
+                "required": ["quote", "issue", "correction"],
+                "additionalProperties": False,
+            },
+        },
+        "grammar_strengths": {"type": "array", "items": _QUOTE_NOTE_SCHEMA},
+        "vocabulary_strengths": {"type": "array", "items": _QUOTE_NOTE_SCHEMA},
+        "vocabulary_issues": {"type": "array", "items": _QUOTE_ISSUE_SCHEMA},
+        "fluency_observations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "quote": {"type": "string"},
+                    "pattern": {
+                        "type": "string",
+                        "enum": ["filler", "run-on", "self-correction", "repetition", "incomplete-thought"],
+                    },
+                },
+                "required": ["label", "quote", "pattern"],
+                "additionalProperties": False,
+            },
+        },
+        "quantitative_note": {"type": "string"},
+    },
+    "required": [
+        "grammar_errors", "grammar_strengths", "vocabulary_strengths",
+        "vocabulary_issues", "fluency_observations", "quantitative_note",
+    ],
+    "additionalProperties": False,
+}
+
+_PRONUNCIATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "genuine_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "phoneme": {"type": "string"},
+                    "total_occurrences_flagged": {"type": "integer"},
+                    "note": {"type": "string"},
+                },
+                "required": ["phoneme", "total_occurrences_flagged", "note"],
+                "additionalProperties": False,
+            },
+        },
+        "excluded_as_likely_artifacts": {"type": "array", "items": {"type": "string"}},
+        "overall_note": {"type": "string"},
+    },
+    "required": ["genuine_issues", "excluded_as_likely_artifacts", "overall_note"],
+    "additionalProperties": False,
+}
+
+_FINAL_SCORING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fluency": {"type": "number"},
+        "lexical": {"type": "number"},
+        "grammar": {"type": "number"},
+        "pronunciation": {"type": "number"},
+        "overall": {"type": "number"},
+        "generalSummary": {"type": "string"},
+        "keyImprovements": {"type": "array", "items": {"type": "string"}},
+        "evidence": {
+            "type": "object",
+            "properties": {
+                "fluency": {"type": "string"},
+                "lexical": {"type": "string"},
+                "grammar": {"type": "string"},
+                "pronunciation": {"type": "string"},
+                "per_part_feedback": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["fluency", "lexical", "grammar", "pronunciation", "per_part_feedback"],
+            "additionalProperties": False,
+        },
+    },
+    "required": [
+        "fluency", "lexical", "grammar", "pronunciation", "overall",
+        "generalSummary", "keyImprovements", "evidence",
+    ],
+    "additionalProperties": False,
+}
+
+
 def _flatten_segments(parts_grouped: dict) -> list:
     flat = []
     for part_no in sorted(parts_grouped.keys()):
@@ -199,7 +395,10 @@ List up to 6 grammar_errors, 3 grammar_strengths, 3 vocabulary_strengths, 4 voca
 
     user_prompt = f"Transcripts:\n\n{combined}\n\nReturn only the JSON object."
 
-    return await _call_groq_json(system_prompt, user_prompt, label="text_analysis", max_tokens=2500)
+    return await _call_groq_json(
+        system_prompt, user_prompt, label="text_analysis", max_tokens=2500,
+        response_schema=_TEXT_ANALYSIS_SCHEMA,
+    )
 
 
 # ---------- Pass B: Pronunciation (filter artifacts from genuine issues) ----------
@@ -233,7 +432,10 @@ List up to 6 genuine_issues, ranked by how consistently they recur."""
 
     user_prompt = f"Pronunciation evidence per segment:\n\n{combined}\n\nReturn only the JSON object."
 
-    return await _call_groq_json(system_prompt, user_prompt, label="pronunciation")
+    return await _call_groq_json(
+        system_prompt, user_prompt, label="pronunciation",
+        response_schema=_PRONUNCIATION_SCHEMA,
+    )
 
 
 # ---------- Pass D: Final scoring, anchored to real band descriptors ----------
@@ -295,7 +497,10 @@ Return only the JSON object."""
     print(user_prompt)
     print("=" * 70 + "\n")
 
-    return await _call_groq_json(system_prompt, user_prompt, label="final_scoring", max_tokens=1500)
+    return await _call_groq_json(
+        system_prompt, user_prompt, label="final_scoring", max_tokens=1500,
+        response_schema=_FINAL_SCORING_SCHEMA,
+    )
 
 
 _FALLBACK_ANALYSIS = {"note": "Analysis pass failed for this run; see logs."}
