@@ -103,11 +103,19 @@ def extract_json(text: str) -> dict:
 async def _call_groq_json(
     system_prompt: str, user_prompt: str, label: str, max_tokens: int = 2000,
     response_schema: dict | None = None, _is_retry: bool = False,
+    api_key: str | None = None,
 ) -> dict:
     """
     Shared plumbing for every scoring pass: call Groq, log input/output,
     parse JSON. Raises on any failure (after one retry for 429s) --
     callers decide how to degrade.
+
+    api_key: which Groq key/org to bill this call against. Defaults to
+    settings.GROQ_API_KEY (the key every pass used to share). Pass D
+    (final_scoring, see below) points this at settings.groq_api_key_final_scoring
+    instead -- when that's a *separate* Groq org's key, it draws from its
+    own independent TPM bucket rather than whatever Pass A/B already spent
+    this minute on the shared key.
 
     response_schema, when given, is sent as a strict-mode JSON Schema via
     `response_format` -- Groq's docs confirm openai/gpt-oss-20b (our
@@ -121,7 +129,7 @@ async def _call_groq_json(
     swap loses strict-mode support or Groq's guarantee has an edge case.
     """
     headers = {
-        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+        "Authorization": f"Bearer {api_key or settings.GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -169,7 +177,7 @@ async def _call_groq_json(
             await asyncio.sleep(wait_s)
             return await _call_groq_json(
                 system_prompt, user_prompt, label, max_tokens,
-                response_schema=response_schema, _is_retry=True,
+                response_schema=response_schema, _is_retry=True, api_key=api_key,
             )
 
         if response.status_code != 200:
@@ -500,6 +508,7 @@ Return only the JSON object."""
     return await _call_groq_json(
         system_prompt, user_prompt, label="final_scoring", max_tokens=1500,
         response_schema=_FINAL_SCORING_SCHEMA,
+        api_key=settings.groq_api_key_final_scoring,
     )
 
 

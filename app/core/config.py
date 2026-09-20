@@ -7,6 +7,17 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str
     HF_TOKEN: str
 
+    # Dedicated key for the final_scoring pass (Pass D) -- this is the call
+    # most likely to hit Groq's TPM rate limit, since it fires last, after
+    # Pass A (text_analysis) and Pass B (pronunciation) have already spent
+    # this minute's budget on the same key. Groq's rate limits are
+    # org-scoped, not per-key, so this only helps if it's a key from a
+    # *separate* Groq organization -- a second key on the same org shares
+    # the same TPM bucket and does nothing. Optional: falls back to
+    # GROQ_API_KEY (see groq_api_key_final_scoring below) if unset, so
+    # this is safe to deploy before the second account/key exists.
+    GROQ_API_KEY_FINAL_SCORING: str = ""
+
     # Shared secret the Next.js app sends as `X-Internal-Api-Key` on every
     # request. This service has no other auth (CORS is wildcard) so this is
     # the only thing stopping a random caller from burning Groq/RunPod quota.
@@ -86,6 +97,10 @@ class Settings(BaseSettings):
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def groq_api_key_final_scoring(self) -> str:
+        return self.GROQ_API_KEY_FINAL_SCORING or self.GROQ_API_KEY
 
 
 @lru_cache
