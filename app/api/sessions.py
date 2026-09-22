@@ -215,7 +215,7 @@ def get_session(session_id: str):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, user_id, status, created_at, completed_at
+                SELECT id, user_id, status, created_at, completed_at, error_message
                 FROM speaking_sessions
                 WHERE id = %s
                 """,
@@ -261,6 +261,7 @@ def get_session(session_id: str):
         status=SessionStatus(row[2]),
         created_at=row[3],
         completed_at=row[4],
+        error_message=row[5],
         parts=parts,
     )
 

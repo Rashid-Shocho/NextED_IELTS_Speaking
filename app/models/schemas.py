@@ -54,6 +54,10 @@ class SessionResponse(BaseModel):
     status: SessionStatus
     created_at: datetime
     completed_at: Optional[datetime] = None
+    # Set when status is "needs_rerecording" (which parts had no detectable
+    # speech, see app/workers/evaluate.py) or "failed" (the exception
+    # string). None otherwise.
+    error_message: Optional[str] = None
     parts: List[PartResponse] = []
 
 
